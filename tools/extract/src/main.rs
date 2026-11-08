@@ -13,6 +13,7 @@
 //!   and ScriptableObjects with all serialized fields (see `scenes.rs`).
 //! - `world.bin`: versioned `game::data::WorldData` envelope (postcard payload).
 //! - `cloud-meshes.bin`: authored tight sprite meshes keyed by world sprite ID.
+//! - `atmosphere.bin`: scene-local fog and mist controllers and tight meshes.
 
 mod audio;
 mod boulder_fx;
@@ -232,7 +233,7 @@ fn export_scenes(
         .iter()
         .map(|s| (s.name.clone(), (s.img.w, s.img.h, s.ppu)))
         .collect();
-    let (mut world, clip_paths) = world::build(&world::Inputs {
+    let inputs = world::Inputs {
         main: &main,
         blocks: &blocks,
         loader: &loader,
@@ -241,7 +242,14 @@ fn export_scenes(
         sprite_names: &sheet.names_by_path,
         sprite_sizes: &sizes,
         assets_dir: assets,
-    })?;
+    };
+    let (mut world, clip_paths) = world::build(&inputs)?;
+    let atmosphere = world::atmosphere(&inputs)?;
+    let bytes = game::assetfile::encode(game::assetfile::Kind::Atmosphere, &atmosphere)
+        .map_err(|e| e.to_string())?;
+    scene::atmosphere_data::AtmosphereDef::decode(&bytes)?;
+    std::fs::write(out.join(scene::atmosphere_data::FILE_NAME), bytes)
+        .map_err(|e| e.to_string())?;
     boulder_fx.install(&mut world)?;
     world.animations = animations;
     if !world.transforms_valid() {

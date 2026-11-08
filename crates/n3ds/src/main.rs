@@ -21,6 +21,7 @@ use game::controls::RawInput;
 use game::data::WorldData;
 use game::save;
 use game::state::TICK;
+use scene::atmosphere_data::{AtmosphereDef, FILE_NAME as ATMOSPHERE_FILE};
 use scene::session::Session;
 use scene::sheet::Sheet;
 use scene::{top, touch};
@@ -87,6 +88,16 @@ fn main() {
             return;
         }
     };
+    let atmosphere = match AtmosphereDef::load(
+        std::path::Path::new(&format!("{ROMFS}/{ATMOSPHERE_FILE}")),
+        &sheet,
+    ) {
+        Ok(def) => def,
+        Err(e) => {
+            fail(&gfx, &mut hid, &apt, &e);
+            return;
+        }
+    };
     let sheet = Rc::new(sheet);
     let cloud_ids = world
         .clouds
@@ -106,6 +117,7 @@ fn main() {
     let progress = Session::saved_progress(&files);
     let slot = Session::last_slot(&files);
     let mut s = Session::new(world, 0, seed(), progress);
+    s.atmosphere = atmosphere;
     s.storage = Some(Box::new(files));
     s.slot = slot;
     s.debug_lines = false;

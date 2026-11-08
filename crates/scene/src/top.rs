@@ -10,7 +10,7 @@ use game::monarch::Action;
 use game::units::{Anim, ShieldStatus};
 
 use crate::cloud_shadow;
-use crate::clouds::{CloudKind, CloudSample};
+use crate::clouds::{AtmosphereKind, AtmosphereSample, CloudKind, CloudSample};
 use crate::heraldry;
 use crate::render::{Color, Draw, Rect, Renderer};
 use crate::session::Session;
@@ -272,6 +272,7 @@ pub enum DrawItem {
     /// The night star field (Heaven layer, behind the sun and moon).
     Stars,
     Cloud(usize),
+    Atmosphere(usize),
     /// A grass patch.
     Grass(usize),
     FreeSteed(usize),
@@ -305,7 +306,7 @@ fn layer_z(world: &game::data::WorldData) -> f32 {
 
 /// Painter's order: Unity sorts by sorting layer, then order, then distance.
 pub fn draw_list(s: &Session) -> Vec<((i16, i16, f32), DrawItem)> {
-    draw_list_with_effects(s, &[], &[])
+    draw_list_with_effects(s, &[], &[], &[])
 }
 
 struct CloudDraw {
@@ -314,10 +315,19 @@ struct CloudDraw {
     shadow: Option<cloud_shadow::Receiver>,
 }
 
+struct AtmosphereDraw<'a> {
+    id: u32,
+    mesh: &'a crate::cloud_mesh::CloudMesh,
+    at: (f32, f32),
+    z: f32,
+    draw: Draw,
+}
+
 fn draw_list_with_effects(
     s: &Session,
     particles: &[crate::boulder_fx::BoulderParticleSample],
     clouds: &[CloudDraw],
+    atmosphere: &[AtmosphereDraw<'_>],
 ) -> Vec<((i16, i16, f32), DrawItem)> {
     let world = &s.world;
     let g = &s.game;
@@ -460,6 +470,9 @@ fn draw_list_with_effects(
     }
     for (i, cloud) in clouds.iter().enumerate() {
         items.push(((0, 0, -cloud.sample.position[2]), DrawItem::Cloud(i)));
+    }
+    for (i, cloud) in atmosphere.iter().enumerate() {
+        items.push(((0, 0, -cloud.z), DrawItem::Atmosphere(i)));
     }
     for i in 0..g.greed.bolts.len() {
         items.push(((0, 0, -0.7), DrawItem::Bolt(i)));
@@ -1933,7 +1946,8 @@ fn draw_world<R: Renderer>(c: &mut Ctx<R>) {
     let game_z = layer_z(&s.world);
     let particles: Vec<_> = s.boulder_particles.samples(&s.world).collect();
     let clouds = cloud_draws(c, &light, game_z);
-    let items = draw_list_with_effects(s, &particles, &clouds);
+    let atmosphere = atmosphere_draws(s, c.sheet, &light);
+    let items = draw_list_with_effects(s, &particles, &clouds, &atmosphere);
     c.lights = items
         .iter()
         .filter_map(|(_, item)| fire_item(s, item))
@@ -1984,6 +1998,10 @@ fn draw_world<R: Renderer>(c: &mut Ctx<R>) {
                     .cloud_light(p.light);
                 draw.cloud_shadow = clouds[i].shadow;
                 c.world(p.sprite, clouds[i].at, draw);
+            }
+            DrawItem::Atmosphere(i) => {
+                let p = &atmosphere[i];
+                c.r.atmosphere_sprite(p.id, p.mesh, p.at, p.draw);
             }
             DrawItem::Grass(i) => draw_grass(c, i),
             DrawItem::Animal(i) => draw_animal(c, i),
@@ -2039,6 +2057,56 @@ fn draw_world<R: Renderer>(c: &mut Ctx<R>) {
             Color::new(add[0], add[1], add[2], 1.0),
         );
     }
+}
+
+fn atmosphere_tint(sample: AtmosphereSample, light: &Light) -> Option<Color> {
+    let mut ambient = Color::rgba(light.colors[color::AMBIENT]);
+    if sample.kind == AtmosphereKind::Fog {
+        // Pow-Diffuse cuts fragments below .01. The fog sprites have binary
+        // alpha, so the instance alpha alone decides whether anything survives.
+        if sample.tint.a < 0.01 {
+            return None;
+        }
+        ambient.a = 1.0;
+    }
+    Some(sample.tint.times(ambient))
+}
+
+fn atmosphere_draws<'a>(s: &'a Session, sheet: &Sheet, light: &Light) -> Vec<AtmosphereDraw<'a>> {
+    let Some(def) = &s.atmosphere else {
+        return Vec::new();
+    };
+    s.clouds
+        .atmosphere_samples(def, light)
+        .filter_map(|sample| {
+            let sprite = usize::from(sample.sprite);
+            let id = sheet.id(&def.sprites[sprite])?;
+            let art = sheet.get(id);
+            let [x, y, z] = sample.position;
+            let extent = art.px.abs().max((f32::from(art.w) - art.px).abs());
+            if x.abs() * PPU > W / 2.0 + extent * sample.scale[0] + 16.0 {
+                return None;
+            }
+            let at = layer_to_screen(s, x, y, 0.0);
+            let top = at.1 - art.py * sample.scale[1];
+            if top >= H || top + f32::from(art.h) * sample.scale[1] <= 0.0 {
+                return None;
+            }
+            let tint = atmosphere_tint(sample, light)?;
+            Some(AtmosphereDraw {
+                id,
+                mesh: &def.meshes[sprite],
+                at,
+                z,
+                draw: Draw::tint(tint).flip(sample.flip).affine([
+                    sample.scale[0],
+                    0.0,
+                    0.0,
+                    sample.scale[1],
+                ]),
+            })
+        })
+        .collect()
 }
 
 fn cloud_draws(c: &mut Ctx<'_, impl Renderer>, light: &Light, game_z: f32) -> Vec<CloudDraw> {
@@ -2299,6 +2367,33 @@ fn draw_overlays<R: Renderer>(c: &mut Ctx<R>) {
 #[cfg(test)]
 mod tests {
     use super::sort_key;
+
+    #[test]
+    fn fog_alpha_cutoff_and_mist_ambient_alpha_follow_their_pc_materials() {
+        use super::{atmosphere_tint, color, AtmosphereKind, AtmosphereSample, Color, Light};
+
+        let mut light = Light::default();
+        light.colors[color::AMBIENT] = [0.5, 0.25, 0.125, 0.5];
+        let mut sample = AtmosphereSample {
+            kind: AtmosphereKind::Fog,
+            sprite: 0,
+            position: [0.0; 3],
+            scale: [1.0; 2],
+            flip: false,
+            tint: Color::new(0.5, 0.75, 1.0, 0.009),
+        };
+        assert_eq!(atmosphere_tint(sample, &light), None);
+        sample.tint.a = 0.01;
+        assert_eq!(
+            atmosphere_tint(sample, &light),
+            Some(Color::new(0.25, 0.1875, 0.125, 0.01))
+        );
+        sample.kind = AtmosphereKind::Mist;
+        assert_eq!(
+            atmosphere_tint(sample, &light),
+            Some(Color::new(0.25, 0.1875, 0.125, 0.005))
+        );
+    }
 
     #[derive(Default)]
     struct Capture(Vec<(u32, (f32, f32), super::Draw)>, usize);

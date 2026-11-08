@@ -3,6 +3,7 @@
 //! backends only supply drawing, input, files and timing.
 
 pub mod adpcm;
+pub mod atmosphere_data;
 pub mod boulder_fx;
 pub mod camera;
 #[cfg(feature = "clipfile")]

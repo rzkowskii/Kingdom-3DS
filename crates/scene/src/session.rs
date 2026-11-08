@@ -91,6 +91,7 @@ pub struct Session {
     camera: crate::camera::Camera,
     pub boulder_particles: crate::boulder_fx::BoulderParticles,
     pub clouds: crate::clouds::Clouds,
+    pub atmosphere: Option<crate::atmosphere_data::AtmosphereDef>,
     stars: Stars,
     pub bag_bounce: f32,
     pub day_banner: Option<(u32, f32)>,
@@ -280,6 +281,7 @@ impl Session {
             camera,
             boulder_particles: Default::default(),
             clouds: crate::clouds::Clouds::new(seed, camera_x),
+            atmosphere: None,
             stars: Stars::default(),
             bag_bounce: 0.0,
             day_banner: None,
@@ -846,8 +848,13 @@ impl Session {
             }
             self.camera_x = self.camera.step(&self.world.camera, target, TICK);
             let camera_x = self.camera_x + self.camera_shake_offset()[0];
-            self.clouds
-                .step(&self.world, &self.game.blender.state, TICK, camera_x);
+            self.clouds.step(
+                &self.world,
+                self.atmosphere.as_ref(),
+                &self.game.blender.state,
+                TICK,
+                camera_x,
+            );
         }
         // orig: Water.Update: the maps drift and keep still against the ground
         // as the camera pans (a quarter of a map per unit, 4 maps per band).

@@ -17,21 +17,34 @@ pub struct CloudMesh {
 
 impl CloudMesh {
     pub(crate) fn valid_for(&self, sprite: &Sprite) -> bool {
+        self.valid_geometry(false) && self.fits(sprite)
+    }
+
+    pub(crate) fn fits(&self, sprite: &Sprite) -> bool {
+        self.vertices.iter().all(|[x, y]| {
+            (0.0..=f32::from(sprite.w)).contains(&(x + sprite.px))
+                && (0.0..=f32::from(sprite.h)).contains(&(y + sprite.py))
+        })
+    }
+
+    pub(crate) fn valid_geometry(&self, allow_collinear: bool) -> bool {
+        let mut visible = false;
         (3..=64).contains(&self.vertices.len())
             && (3..=192).contains(&self.indices.len())
             && self.indices.len().is_multiple_of(3)
-            && self.vertices.iter().all(|[x, y]| {
-                (0.0..=f32::from(sprite.w)).contains(&(x + sprite.px))
-                    && (0.0..=f32::from(sprite.h)).contains(&(y + sprite.py))
-            })
+            && self.vertices.iter().flatten().all(|v| v.is_finite())
             && self.indices.as_chunks::<3>().0.iter().all(|&triangle| {
                 let [Some(a), Some(b), Some(c)] =
                     triangle.map(|i| self.vertices.get(usize::from(i)))
                 else {
                     return false;
                 };
-                (b[0] - a[0]) * (c[1] - a[1]) != (b[1] - a[1]) * (c[0] - a[0])
+                let has_area = (b[0] - a[0]) * (c[1] - a[1]) != (b[1] - a[1]) * (c[0] - a[0]);
+                visible |= has_area;
+                let [i, j, k] = triangle;
+                has_area || (allow_collinear && i != j && j != k && k != i)
             })
+            && visible
     }
 }
 

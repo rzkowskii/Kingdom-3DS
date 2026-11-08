@@ -1178,6 +1178,10 @@ impl CloudsDef {
 
 impl CloudLayerDef {
     pub fn valid(&self, sprite_count: usize) -> bool {
+        self.valid_with_parallax(sprite_count, 1.0)
+    }
+
+    pub fn valid_with_parallax(&self, sprite_count: usize, max_parallax: f32) -> bool {
         let curve_valid = |curve: &Curve, min, max| {
             (1..=16).contains(&curve.keys.len())
                 && curve.keys.iter().all(|&[t, v, incoming, outgoing]| {
@@ -1204,7 +1208,7 @@ impl CloudLayerDef {
                 .all(|&id| usize::from(id) < sprite_count)
             && curve_valid(&self.y_curve, -100.0, 100.0)
             && curve_valid(&self.scale_curve, 0.01, 10.0)
-            && curve_valid(&self.parallax_curve, 0.0, 1.0)
+            && curve_valid(&self.parallax_curve, 0.0, max_parallax)
     }
 }
 

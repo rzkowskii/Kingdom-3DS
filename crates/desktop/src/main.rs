@@ -20,6 +20,7 @@ mod assets;
 mod audio;
 mod storage;
 
+use ::scene::atmosphere_data::{AtmosphereDef, FILE_NAME as ATMOSPHERE_FILE};
 use ::scene::session::Session;
 use ::scene::top::{self, draw_list, layer_to_screen, DrawItem};
 use ::scene::touch::{self, Tap};
@@ -114,6 +115,14 @@ async fn main() {
         }
     };
     let sheet = assets.sheet.clone();
+    let atmosphere =
+        match AtmosphereDef::load(&std::path::Path::new(&dir).join(ATMOSPHERE_FILE), &sheet) {
+            Ok(def) => def,
+            Err(e) => {
+                eprintln!("could not load atmosphere assets: {e}");
+                std::process::exit(1);
+            }
+        };
     let seed = std::env::args()
         .skip_while(|a| a != "--seed")
         .nth(1)
@@ -155,6 +164,7 @@ async fn main() {
             }
         });
     let mut app = Session::new(world, island, seed, progress);
+    app.atmosphere = atmosphere;
     app.debug = std::env::args().any(|a| a == "--debug");
     if let Some(h) = start_hour {
         app.game.clock.time = h;

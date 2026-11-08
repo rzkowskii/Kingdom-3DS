@@ -3,7 +3,7 @@ use game::data::{CloudLayerDef, SpriteId, WorldData};
 use game::lighting::{color, float, Light};
 use game::rng::Rng;
 
-use crate::render::Color;
+use crate::{atmosphere_data::AtmosphereDef, render::Color};
 
 const APPEAR_COOLDOWN: f32 = 0.5;
 
@@ -26,6 +26,24 @@ pub struct CloudSample {
     pub light: Color,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AtmosphereKind {
+    Fog,
+    Mist,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AtmosphereSample {
+    pub kind: AtmosphereKind,
+    /// Index into `AtmosphereDef::sprites` and `AtmosphereDef::meshes`.
+    pub sprite: SpriteId,
+    pub position: [f32; 3],
+    pub scale: [f32; 2],
+    pub flip: bool,
+    /// The Blender color with the instance lifetime applied to alpha.
+    pub tint: Color,
+}
+
 #[derive(Clone, Debug)]
 struct Cloud {
     sprite: SpriteId,
@@ -46,6 +64,14 @@ fn snap(value: f32) -> f32 {
 }
 
 impl Cloud {
+    fn position(&self, def: &CloudLayerDef) -> [f32; 3] {
+        [
+            snap(def.origin[0] + self.x),
+            snap(def.origin[1] + self.y),
+            def.origin[2] + self.z,
+        ]
+    }
+
     fn new(def: &CloudLayerDef, rng: &mut Rng) -> Self {
         // RandomizeSprite.Awake: choose the flip before the sprite. The
         // zero-probability deactivate check still consumes a random draw.
@@ -124,6 +150,12 @@ struct Deck {
 }
 
 impl Deck {
+    fn visible(&self, base_alpha: f32) -> impl Iterator<Item = &Cloud> {
+        self.clouds
+            .iter()
+            .filter(move |cloud| cloud.active && cloud.alpha > 0.0 && base_alpha > 0.0)
+    }
+
     fn step(
         &mut self,
         def: &CloudLayerDef,
@@ -196,8 +228,11 @@ impl Wind {
 pub struct Clouds {
     stratus: Deck,
     cumulus: Deck,
+    fog: Deck,
+    mist: Deck,
     wind: Wind,
     rng: Rng,
+    atmosphere_rng: Rng,
     last_camera_x: f32,
 }
 
@@ -206,37 +241,73 @@ impl Clouds {
         Self {
             stratus: Deck::default(),
             cumulus: Deck::default(),
+            fog: Deck::default(),
+            mist: Deck::default(),
             wind: Wind::default(),
             rng: Rng::new(seed ^ 0xe91b_2a4d),
+            atmosphere_rng: Rng::new(seed ^ 0xf063_8a9b),
             last_camera_x: snap(camera_x),
         }
     }
 
-    pub(crate) fn step(&mut self, world: &WorldData, light: &Light, dt: f32, camera_x: f32) {
-        let Some(def) = &world.clouds else { return };
+    pub(crate) fn step(
+        &mut self,
+        world: &WorldData,
+        atmosphere: Option<&AtmosphereDef>,
+        light: &Light,
+        dt: f32,
+        camera_x: f32,
+    ) {
+        if world.clouds.is_none() && atmosphere.is_none() {
+            return;
+        }
         if !dt.is_finite() || dt <= 0.0 || !camera_x.is_finite() {
             return;
         }
-        self.wind.step(dt, def.wind_change_cooldown, &mut self.rng);
+        let cooldown = world
+            .clouds
+            .as_ref()
+            .map_or(60.0, |def| def.wind_change_cooldown);
+        self.wind.step(dt, cooldown, &mut self.rng);
         let camera_x = snap(camera_x);
         let delta = camera_x - self.last_camera_x;
         self.last_camera_x = camera_x;
-        self.stratus.step(
-            &def.stratus,
-            light.floats[float::CLOUD_STRATUS_DENSITY],
-            dt,
-            self.wind.value,
-            delta,
-            &mut self.rng,
-        );
-        self.cumulus.step(
-            &def.cumulus,
-            light.floats[float::CLOUD_DENSITY],
-            dt,
-            self.wind.value,
-            delta,
-            &mut self.rng,
-        );
+        if let Some(def) = &world.clouds {
+            for (deck, layer, density) in [
+                (
+                    &mut self.stratus,
+                    &def.stratus,
+                    float::CLOUD_STRATUS_DENSITY,
+                ),
+                (&mut self.cumulus, &def.cumulus, float::CLOUD_DENSITY),
+            ] {
+                deck.step(
+                    layer,
+                    light.floats[density],
+                    dt,
+                    self.wind.value,
+                    delta,
+                    &mut self.rng,
+                );
+            }
+        }
+        if let Some(def) = atmosphere {
+            // Share the world's wind, with a separate presentation RNG so
+            // fog and mist cannot perturb the existing sky decks' sequence.
+            for (deck, layer, density) in [
+                (&mut self.fog, &def.fog, float::FOG_DENSITY),
+                (&mut self.mist, &def.mist, float::MIST_DENSITY),
+            ] {
+                deck.step(
+                    layer,
+                    light.floats[density],
+                    dt,
+                    self.wind.value,
+                    delta,
+                    &mut self.atmosphere_rng,
+                );
+            }
+        }
     }
 
     pub fn samples<'a>(
@@ -268,28 +339,53 @@ impl Clouds {
             })
             .flat_map(move |(deck, def, kind, base, light)| {
                 let ambient = state.colors[color::AMBIENT];
-                deck.clouds
-                    .iter()
-                    .filter(move |cloud| cloud.active && cloud.alpha > 0.0 && base[3] > 0.0)
-                    .map(move |cloud| CloudSample {
-                        kind,
-                        sprite: cloud.sprite,
-                        position: [
-                            snap(def.origin[0] + cloud.x),
-                            snap(def.origin[1] + cloud.y),
-                            def.origin[2] + cloud.z,
-                        ],
-                        scale: cloud.scale,
-                        flip: cloud.flip,
-                        tint: Color::new(
-                            base[0] * ambient[0],
-                            base[1] * ambient[1],
-                            base[2] * ambient[2],
-                            base[3] * cloud.alpha,
-                        ),
-                        light: Color::rgba(light),
-                    })
+                deck.visible(base[3]).map(move |cloud| CloudSample {
+                    kind,
+                    sprite: cloud.sprite,
+                    position: cloud.position(def),
+                    scale: cloud.scale,
+                    flip: cloud.flip,
+                    tint: Color::new(
+                        base[0] * ambient[0],
+                        base[1] * ambient[1],
+                        base[2] * ambient[2],
+                        base[3] * cloud.alpha,
+                    ),
+                    light: Color::rgba(light),
+                })
             })
+    }
+
+    pub fn atmosphere_samples<'a>(
+        &'a self,
+        def: &'a AtmosphereDef,
+        state: &Light,
+    ) -> impl Iterator<Item = AtmosphereSample> + 'a {
+        [
+            (
+                &self.fog,
+                &def.fog,
+                AtmosphereKind::Fog,
+                state.colors[color::FOG],
+            ),
+            (
+                &self.mist,
+                &def.mist,
+                AtmosphereKind::Mist,
+                state.colors[color::MIST],
+            ),
+        ]
+        .into_iter()
+        .flat_map(|(deck, layer, kind, base)| {
+            deck.visible(base[3]).map(move |cloud| AtmosphereSample {
+                kind,
+                sprite: cloud.sprite,
+                position: cloud.position(layer),
+                scale: cloud.scale,
+                flip: cloud.flip,
+                tint: Color::new(base[0], base[1], base[2], base[3] * cloud.alpha),
+            })
+        })
     }
 }
 
@@ -424,7 +520,7 @@ mod tests {
         light.floats[float::CLOUD_DENSITY] = 0.1;
         let mut clouds = Clouds::new(10, 8.0);
         for _ in 0..3 {
-            clouds.step(&world, &light, 1.0, 8.0);
+            clouds.step(&world, None, &light, 1.0, 8.0);
         }
         let before: Vec<_> = clouds.samples(&world, &light).collect();
         assert_eq!(before.len(), 2);
@@ -448,5 +544,96 @@ mod tests {
                 (b.sprite, b.position, b.scale, b.flip)
             );
         }
+    }
+
+    #[test]
+    fn fog_and_mist_follow_their_own_blender_density_color_and_fade() {
+        let fog = CloudLayerDef {
+            origin: [0.0, 1.0, -5.0],
+            depth: 3.0,
+            scale_curve: constant(2.0),
+            parallax_curve: constant(1.25),
+            sprites: vec![0],
+            ..layer()
+        };
+        let mist = CloudLayerDef {
+            origin: [0.0, 0.5, 1.5],
+            depth: 3.0,
+            lifetime: 12.0,
+            fade_time: 2.0,
+            vertical_motion: 0.1,
+            scale_curve: constant(1.0),
+            sprites: vec![1],
+            ..layer()
+        };
+        let def = AtmosphereDef {
+            fog,
+            mist,
+            sprites: vec!["fog".into(), "mist".into()],
+            meshes: Vec::new(),
+        };
+        let mut clouds = Clouds::new(4, 0.0);
+        let world = WorldData::default();
+        let mut light = Light::default();
+        light.colors[color::FOG] = [0.5, 0.75, 0.25, 0.5];
+        light.colors[color::MIST] = [0.25, 0.5, 0.75, 0.75];
+        light.floats[float::FOG_DENSITY] = 0.1;
+        for _ in 0..3 {
+            clouds.step(&world, Some(&def), &light, 1.0, 0.0);
+        }
+        let samples: Vec<_> = clouds.atmosphere_samples(&def, &light).collect();
+        assert_eq!(samples.len(), 1);
+        let fog = samples[0];
+        assert_eq!(fog.kind, AtmosphereKind::Fog);
+        assert_eq!(fog.sprite, 0);
+        assert_eq!(fog.tint, Color::new(0.5, 0.75, 0.25, 0.0625));
+        assert_eq!(fog.scale, [2.0; 2]);
+        assert!((-5.0..-2.0).contains(&fog.position[2]));
+
+        light.floats[float::FOG_DENSITY] = 0.0;
+        light.floats[float::MIST_DENSITY] = 0.1;
+        for _ in 0..8 {
+            clouds.step(&world, Some(&def), &light, 1.0, 0.0);
+        }
+        let samples: Vec<_> = clouds.atmosphere_samples(&def, &light).collect();
+        assert_eq!(samples.len(), 1);
+        let mist = samples[0];
+        assert_eq!(mist.kind, AtmosphereKind::Mist);
+        assert_eq!(mist.sprite, 1);
+        assert_eq!(mist.tint, Color::new(0.25, 0.5, 0.75, 0.75));
+        assert_eq!(mist.scale, [1.0; 2]);
+        assert!((1.5..4.5).contains(&mist.position[2]));
+    }
+
+    #[test]
+    fn foreground_fog_uses_greater_than_one_parallax_and_mist_drifts_then_retires() {
+        let fog = CloudLayerDef {
+            parallax_curve: constant(1.25),
+            ..layer()
+        };
+        let mut rng = Rng::new(6);
+        let mut cloud = Cloud::new(&fog, &mut rng);
+        cloud.x = 1.0;
+        cloud.step(&fog, 0.5, 1.0, 1.0);
+        assert_eq!(cloud.x, 0.21875);
+
+        let mist = CloudLayerDef {
+            lifetime: 12.0,
+            fade_time: 2.0,
+            vertical_motion: 0.1,
+            ..layer()
+        };
+        cloud.fade_in(&mist, &mut rng);
+        let start_y = cloud.y;
+        cloud.step(&mist, 1.0, 0.0, 0.0);
+        assert_eq!(cloud.alpha, 0.5);
+        assert!(cloud.y > start_y);
+        cloud.step(&mist, 5.0, 0.0, 0.0);
+        let midpoint_y = cloud.y;
+        cloud.step(&mist, 5.0, 0.0, 0.0);
+        assert_eq!(cloud.alpha, 0.5);
+        assert!(cloud.y < midpoint_y);
+        cloud.step(&mist, 1.0, 0.0, 0.0);
+        assert!(!cloud.active);
     }
 }

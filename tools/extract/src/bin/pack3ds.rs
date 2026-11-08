@@ -8,7 +8,7 @@
 //!   run on the GPU: the keyed pixels of each sprite become two extra mask
 //!   sprites that the renderer tints separately.
 //! - Pages go through `tex3ds` into `.t3x`; the sheet (sprites, clips, font)
-//!   becomes `sheet.bin`; `world.bin` and `cloud-meshes.bin` are copied as is.
+//!   becomes `sheet.bin`; the world and presentation sidecars are copied as is.
 //! - The sound clips (`audio/*.adp`, ~100 MB) go on the SD card instead, so
 //!   the `.3dsx` stays small: into `sdcard/3ds/kingdom-3ds/audio` beside the
 //!   romfs folder, to copy onto the card's root once.
@@ -34,9 +34,9 @@ struct Img {
     px: Vec<u8>,
 }
 
-fn split_recolor(base: &mut Img, cloud: bool) -> [Option<Img>; 2] {
-    // Cloud alpha is shader coverage, even when it equals a recolour key.
-    if cloud {
+fn split_recolor(base: &mut Img, coverage: bool) -> [Option<Img>; 2] {
+    // Atmospheric alpha is coverage, even when it equals a recolour key.
+    if coverage {
         return [None, None];
     }
     [KEY_A, KEY_B].map(|key| {
@@ -196,6 +196,22 @@ fn run(src: &Path, out: &Path) -> Result<(), String> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(e) => return Err(format!("{cloud_mesh_file}: {e}")),
     };
+    let atmosphere_file = scene::atmosphere_data::FILE_NAME;
+    let (atmosphere, atmosphere_sprites) = match std::fs::read(src.join(atmosphere_file)) {
+        Ok(bytes) => {
+            let def = scene::atmosphere_data::AtmosphereDef::decode(&bytes)
+                .map_err(|e| format!("{atmosphere_file}: {e}"))?;
+            def.validate_sheet(&sheet)?;
+            let sprites = def
+                .sprites
+                .iter()
+                .filter_map(|name| sheet.id(name))
+                .collect();
+            (Some(bytes), sprites)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (None, HashSet::new()),
+        Err(e) => return Err(format!("{atmosphere_file}: {e}")),
+    };
     let cloud_sprites: HashSet<_> = world
         .clouds
         .iter()
@@ -237,7 +253,8 @@ fn run(src: &Path, out: &Path) -> Result<(), String> {
         };
         let s = *s;
         let cloud = cloud_sprites.contains(&(i as u32));
-        for (k, m) in split_recolor(&mut base, cloud).into_iter().enumerate() {
+        let coverage = cloud || atmosphere_sprites.contains(&(i as u32));
+        for (k, m) in split_recolor(&mut base, coverage).into_iter().enumerate() {
             let Some(m) = m else { continue };
             let id = out_sheet.sprites.len();
             out_sheet.sprites.push(Sprite {
@@ -274,9 +291,11 @@ fn run(src: &Path, out: &Path) -> Result<(), String> {
     // Trim each piece to its visible pixels (masks especially are mostly
     // empty); the pivot moves with the trim.
     for p in &mut pieces {
-        // Keep the original cloud crop so its authored vertex UVs cannot
+        // Keep the original atmospheric crop so its authored vertex UVs cannot
         // land in a neighbouring sprite after alpha-only trimming.
-        if sheet.cloud_mesh(p.sprite as u32).is_some() {
+        if sheet.cloud_mesh(p.sprite as u32).is_some()
+            || atmosphere_sprites.contains(&(p.sprite as u32))
+        {
             continue;
         }
         let (w, h) = (p.img.w, p.img.h);
@@ -441,14 +460,19 @@ fn run(src: &Path, out: &Path) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     std::fs::write(out.join("sheet.bin"), bin).map_err(|e| e.to_string())?;
     std::fs::write(out.join("world.bin"), &world_bytes).map_err(|e| format!("world.bin: {e}"))?;
-    let mesh_path = out.join(cloud_mesh_file);
-    if let Some(bytes) = cloud_meshes {
-        std::fs::write(mesh_path, bytes).map_err(|e| format!("{cloud_mesh_file}: {e}"))?;
-    } else {
-        match std::fs::remove_file(mesh_path) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(format!("{cloud_mesh_file}: {e}")),
+    for (name, sidecar) in [
+        (cloud_mesh_file, cloud_meshes),
+        (atmosphere_file, atmosphere),
+    ] {
+        let path = out.join(name);
+        if let Some(bytes) = sidecar {
+            std::fs::write(path, bytes).map_err(|e| format!("{name}: {e}"))?;
+        } else {
+            match std::fs::remove_file(path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(format!("{name}: {e}")),
+            }
         }
     }
     let sd = out

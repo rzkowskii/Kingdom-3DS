@@ -1042,11 +1042,11 @@ impl Gpu {
         }
     }
 
-    /// Unity's tight sprite triangles and a separate screen-grid exposure mask.
-    fn cloud_sprite(&mut self, id: u32, at: (f32, f32), d: &Draw, light: Color) {
+    /// Unity's tight sprite triangles, with an exposure mask for cloud receivers.
+    fn indexed_sprite(&mut self, id: u32, mesh: Option<&CloudMesh>, at: (f32, f32), d: &Draw) {
         let sheet = Rc::clone(&self.sheet);
         let s = sheet.get(id);
-        let geometry = cloud_shadow::Geometry::new(s, sheet.cloud_mesh(id));
+        let geometry = cloud_shadow::Geometry::new(s, mesh.or_else(|| sheet.cloud_mesh(id)));
         let triangles = geometry.indices().as_chunks::<3>().0;
         let z = -0.999 + self.order as f32 * Z_STEP;
         self.order += 1;
@@ -1066,16 +1066,18 @@ impl Gpu {
                 mask.tile[1] as i16 - mask.origin[1] - ATLAS_HEIGHT as i16,
             ]
         });
-        let light = u32::from_le_bytes(color(light));
         let state = State {
             page: Some(s.page),
-            additive: false,
+            additive: d.cloud_light.is_none() && d.additive,
             smooth: false,
-            effect: if mask.is_some() {
-                Effect::ShadowedCloud(light)
-            } else {
-                Effect::Cloud(light)
-            },
+            effect: d.cloud_light.map_or(Effect::None, |light| {
+                let light = u32::from_le_bytes(color(light));
+                if mask.is_some() {
+                    Effect::ShadowedCloud(light)
+                } else {
+                    Effect::Cloud(light)
+                }
+            }),
         };
         let (pw, ph) = self.page_size[s.page as usize];
         let depth = self.depth;
@@ -1186,8 +1188,8 @@ impl Renderer for Gpu {
     }
 
     fn sprite(&mut self, id: u32, at: (f32, f32), d: Draw) {
-        if let Some(light) = d.cloud_light {
-            self.cloud_sprite(id, at, &d, light);
+        if d.cloud_light.is_some() {
+            self.indexed_sprite(id, None, at, &d);
             return;
         }
         let masks = self.sheet.get(id).masks;
@@ -1200,6 +1202,10 @@ impl Renderer for Gpu {
                 self.sprite_part(m, at, &d, tint);
             }
         }
+    }
+
+    fn atmosphere_sprite(&mut self, id: u32, mesh: &CloudMesh, at: (f32, f32), d: Draw) {
+        self.indexed_sprite(id, Some(mesh), at, &d);
     }
 
     fn sliced(&mut self, id: u32, dest: Rect, border: (f32, f32, f32, f32), tint: Color) {

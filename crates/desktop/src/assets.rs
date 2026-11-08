@@ -378,9 +378,15 @@ impl Assets {
         })
     }
 
-    fn cloud_sprite(&self, id: u32, at: (f32, f32), d: &Draw, light: Color) {
+    fn indexed_sprite(
+        &self,
+        id: u32,
+        mesh: Option<&cloud_mesh::CloudMesh>,
+        at: (f32, f32),
+        d: &Draw,
+    ) {
         let sprite = self.sheet.get(id);
-        let geometry = Geometry::new(sprite, self.sheet.cloud_mesh(id));
+        let geometry = Geometry::new(sprite, mesh);
         let texture = &self.pages[usize::from(sprite.page)];
         let shadow = self.shadow_camera.zip(d.cloud_shadow);
         let color = mc(d.tint);
@@ -403,14 +409,20 @@ impl Assets {
                 vertex
             })
             .collect();
-        gl_use_material(&self.cloud);
-        self.cloud.set_uniform("CloudLight", mc(light).to_vec());
+        if let Some(light) = d.cloud_light {
+            gl_use_material(&self.cloud);
+            self.cloud.set_uniform("CloudLight", mc(light).to_vec());
+        } else if d.additive {
+            gl_use_material(&self.additive);
+        }
         draw_mesh(&Mesh {
             vertices,
             indices: geometry.indices().to_vec(),
             texture: Some(texture.clone()),
         });
-        gl_use_default_material();
+        if d.cloud_light.is_some() || d.additive {
+            gl_use_default_material();
+        }
     }
 }
 
@@ -456,8 +468,8 @@ impl Renderer for Assets {
     }
 
     fn sprite(&mut self, id: u32, at: (f32, f32), d: Draw) {
-        if let Some(light) = d.cloud_light {
-            self.cloud_sprite(id, at, &d, light);
+        if d.cloud_light.is_some() {
+            self.indexed_sprite(id, self.sheet.cloud_mesh(id), at, &d);
             return;
         }
         let s = *self.sheet.get(id);
@@ -519,6 +531,16 @@ impl Renderer for Assets {
         if d.recolor.is_some() || d.overlay.is_some() || d.additive {
             gl_use_default_material();
         }
+    }
+
+    fn atmosphere_sprite(
+        &mut self,
+        id: u32,
+        mesh: &cloud_mesh::CloudMesh,
+        at: (f32, f32),
+        d: Draw,
+    ) {
+        self.indexed_sprite(id, Some(mesh), at, &d);
     }
 
     /// orig: `Image.Type.Sliced`.

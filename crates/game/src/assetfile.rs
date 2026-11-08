@@ -14,6 +14,7 @@ pub enum Kind {
     World,
     Sheet,
     CloudMeshes,
+    Atmosphere,
 }
 
 impl Kind {
@@ -22,6 +23,7 @@ impl Kind {
             Self::World => *b"KNLW",
             Self::Sheet => *b"KNLS",
             Self::CloudMeshes => *b"KNLC",
+            Self::Atmosphere => *b"KNLA",
         }
     }
 }
