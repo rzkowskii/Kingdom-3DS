@@ -1,6 +1,6 @@
 ; Sprite vertex shader: screen-space position through the screen's
 ; projection, sprite UV passed through, byte colour scaled to 0..1.
-; The cloud exposure atlas uses integer pixel coordinates as a second UV.
+; The cloud exposure atlas uses shifted eye coordinates plus a per-sprite offset.
 ; The position's w is the item's stereo depth: each eye shifts it by
 ; depth * eye.x pixels (eye.x is 0 without 3D).
 
@@ -9,7 +9,7 @@
 
 .constf ones(1.0, 1.0, 1.0, 1.0)
 .constf inv255(0.003921569, 0.003921569, 0.003921569, 0.003921569)
-.constf cloud_uv_scale(0.001953125, 0.0009765625, 0.0, 0.0)
+.constf cloud_uv_scale(0.0009765625, -0.0009765625, 0.0, 0.0)
 
 .out outpos position
 .out outtc0 texcoord0
@@ -33,7 +33,8 @@
 	dp4 outpos.w, projection[3], r0
 
 	mov outtc0, intex
-	mul outtc1, cloud_uv_scale, incloud
+	add r2, r0, incloud
+	mul outtc1, cloud_uv_scale, r2
 	mul outclr, inv255, inclr
 	end
 .end

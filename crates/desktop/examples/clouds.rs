@@ -19,6 +19,7 @@ use game::lighting::{color, float, Light};
 use game::progress::Progress;
 use game::state::GameEvent;
 use game::time::{DayCounter, DayEvent, DAY_START};
+use macroquad::miniquad::{BlendFactor, BlendState, BlendValue, Equation};
 use macroquad::prelude::*;
 use serde_json::{json, Value};
 use std::path::Path;
@@ -282,6 +283,83 @@ fn shadowed_sky_pixels(shadowed: &Image, unshadowed: &Image) -> usize {
         .count()
 }
 
+/// Use the live shader to verify distinct exposure inside one source texel.
+fn fragment_probe() -> [u8; 3] {
+    const W: usize = 12;
+    const H: usize = 4;
+    let mut depth = vec![1.0; 512 * 256];
+    for (y, row) in depth.as_chunks_mut::<512>().0.iter_mut().enumerate() {
+        row[..128].fill(0.9);
+        if y == 127 || y == 128 {
+            row[128..256].fill(0.9);
+        }
+    }
+    let mut bytes = vec![0; depth.len() * 4];
+    assets::encode_depth(&depth, &mut bytes);
+    let map = Texture2D::from_rgba8(512, 256, &bytes);
+    map.set_filter(FilterMode::Nearest);
+    let cloud = Texture2D::from_rgba8(1, 1, &[0, 0, 0, 128]);
+    cloud.set_filter(FilterMode::Nearest);
+    let material = load_material(
+        ShaderSource::Glsl {
+            vertex: assets::CLOUD_VS,
+            fragment: assets::CLOUD_FS,
+        },
+        MaterialParams {
+            uniforms: vec![UniformDesc::new("CloudLight", UniformType::Float4)],
+            textures: vec!["CloudDepth".into()],
+            pipeline_params: PipelineParams {
+                color_blend: Some(BlendState::new(
+                    Equation::Add,
+                    BlendFactor::Value(BlendValue::SourceAlpha),
+                    BlendFactor::OneMinusValue(BlendValue::SourceAlpha),
+                )),
+                ..Default::default()
+            },
+        },
+    )
+    .expect("cloud fragment material");
+    material.set_texture("CloudDepth", map.clone());
+    material.set_uniform("CloudLight", vec4(1.0, 0.0, 0.0, 0.0));
+    let target = render_target(W as u32, H as u32);
+    let mut probe_camera = Camera2D::from_display_rect(Rect::new(0.0, 0.0, W as f32, H as f32));
+    probe_camera.zoom.y = -probe_camera.zoom.y;
+    probe_camera.render_target = Some(target.clone());
+    set_camera(&probe_camera);
+    clear_background(BLACK);
+    gl_use_material(&material);
+    draw_mesh(&Mesh {
+        vertices: [
+            (0.0, 0.0),
+            (W as f32, 0.0),
+            (W as f32, H as f32),
+            (0.0, H as f32),
+        ]
+        .into_iter()
+        .map(|(x, y)| {
+            let mut vertex = Vertex::new(x, y, 0.0, 0.5, 0.5, WHITE);
+            // The first tap is centered on row 127. The second must skip
+            // row 128, which would keep the middle fragment fully shaded.
+            vertex.normal = vec4(x / W as f32 * 384.0 - 0.5, 127.0, 10.0, 1.0);
+            vertex
+        })
+        .collect(),
+        indices: vec![0, 1, 2, 0, 2, 3],
+        texture: Some(cloud),
+    });
+    gl_use_default_material();
+    set_default_camera();
+    let pixels = target.texture.get_texture_data().bytes;
+    let samples = [1, 5, 9].map(|x| pixels[(2 * W + x) * 4]);
+    for (value, expected) in samples.into_iter().zip([0, 32, 64]) {
+        assert!(
+            value.abs_diff(expected) <= 1,
+            "0%, 50%, 100% exposure at three fragments of one texel: {samples:?}"
+        );
+    }
+    samples
+}
+
 fn cloud_receipt(clouds: &[CloudSample], kind: CloudKind) -> Value {
     let mut matching = clouds.iter().filter(|c| c.kind == kind);
     let first = matching.next().expect("cloud sample");
@@ -314,6 +392,14 @@ async fn main() {
     for target in [&capture.screen, &capture.previous] {
         target.texture.set_filter(FilterMode::Nearest);
     }
+    let fragment_probe_rgb8 = fragment_probe();
+    let tight_meshes = world
+        .clouds
+        .iter()
+        .flat_map(game::data::CloudsDef::sprite_ids)
+        .filter_map(|id| capture.renderer.sheet.world(id))
+        .filter(|&id| capture.renderer.sheet.cloud_mesh(id).is_some())
+        .count();
 
     let (mut boss, portal) = stage(&world, true);
     let (mut control, control_portal) = stage(&world, false);
@@ -416,6 +502,8 @@ async fn main() {
         "seed": SEED,
         "width": WIDTH,
         "height": HEIGHT,
+        "tight_cloud_meshes": tight_meshes,
+        "fragment_probe_red8": fragment_probe_rgb8,
         "red_moon_preset": world.lights[preset as usize].name,
         "portal": portal,
         "admission_tick": admission_tick,

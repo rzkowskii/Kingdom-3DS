@@ -140,6 +140,9 @@ fn parse_mesh(text: &str) -> Result<(String, String, f32, Mesh), String> {
         return Err("vertex data size mismatch".into());
     }
     let stride = data.len() / count;
+    if stride < 8 || !idx.len().is_multiple_of(6) {
+        return Err("bad sprite vertex or index buffer".into());
+    }
     let f = |o: usize| f32::from_le_bytes(data[o..o + 4].try_into().unwrap());
     let verts = (0..count)
         .map(|i| {
@@ -158,6 +161,59 @@ fn parse_mesh(text: &str) -> Result<(String, String, f32, Mesh), String> {
     }
     let tris = ids.chunks(3).map(|t| [t[0], t[1], t[2]]).collect();
     Ok((name, tex, ppu, Mesh { verts, tris }))
+}
+
+/// Read the authored tight mesh without changing the existing atlas crop.
+pub fn cloud_mesh(path: &Path) -> Result<scene::cloud_mesh::CloudMesh, String> {
+    let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    parse_cloud_mesh(&text).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+fn parse_cloud_mesh(text: &str) -> Result<scene::cloud_mesh::CloudMesh, String> {
+    let (_, _, ppu, mesh) = parse_mesh(text)?;
+    let rd = &text[..text.find("m_AtlasRD:").unwrap_or(text.len())];
+    let uvt = field(rd, "uvTransform")
+        .and_then(|v| inline_map(v, &["x", "y", "z", "w"]))
+        .ok_or("bad cloud uvTransform")?;
+    let vertices = field(rd, "_typelessdata")
+        .and_then(hex_bytes)
+        .ok_or("bad cloud vertex buffer")?;
+    let (stream, tail) = vertices.as_chunks::<20>();
+    // These clouds have one triangle submesh with float3 position followed by
+    // a zeroed float2 UV channel. Unity derives their UVs via uvTransform.
+    if ppu != 32.0
+        || uvt[0] != ppu
+        || uvt[2] != ppu
+        || field(rd, "settingsRaw") != Some("65")
+        || field(rd, "firstByte") != Some("0")
+        || field(rd, "firstVertex") != Some("0")
+        || field(rd, "topology") != Some("0")
+        || field(rd, "m_CurrentChannels") != Some("9")
+        || field(rd, "indexCount").and_then(|v| v.parse::<usize>().ok())
+            != Some(mesh.tris.len() * 3)
+        || rd
+            .lines()
+            .filter(|line| line.trim_start().starts_with("firstByte:"))
+            .count()
+            != 1
+        || !tail.is_empty()
+        || stream.len() != mesh.verts.len()
+        || !stream.iter().all(|v| v[8..].iter().all(|&b| b == 0))
+    {
+        return Err("unsupported cloud mesh layout or UV transform".into());
+    }
+    let local = stream
+        .iter()
+        .map(|v| {
+            let x = f32::from_le_bytes(v[..4].try_into().unwrap());
+            let y = f32::from_le_bytes(v[4..8].try_into().unwrap());
+            [x * ppu, -y * ppu]
+        })
+        .collect();
+    Ok(scene::cloud_mesh::CloudMesh {
+        vertices: local,
+        indices: mesh.tris.into_iter().flatten().map(|i| i as u16).collect(),
+    })
 }
 
 fn inside(p: (f32, f32), a: (f32, f32), b: (f32, f32), c: (f32, f32)) -> bool {
@@ -318,5 +374,40 @@ mod tests {
         assert!(!inside((3.0, 3.0), a, b, c));
         // Winding doesn't matter.
         assert!(inside((1.0, 1.0), a, c, b));
+    }
+
+    #[test]
+    #[ignore = "requires the user's private PC asset export; set KINGDOM_REFERENCE_ASSETS"]
+    fn local_reference_cloud_meshes_retain_vertex_offsets_and_triangle_order() {
+        let assets = PathBuf::from(std::env::var_os("KINGDOM_REFERENCE_ASSETS").unwrap());
+        for (name, count, triangles, first_vertex, first_triangle) in [
+            ("clouds_01", 8, 6, [32., -3.], [7, 6, 5]),
+            ("clouds_02", 8, 6, [20., -15.], [7, 6, 5]),
+            ("clouds_03", 9, 7, [32., -14.], [8, 7, 5]),
+            ("clouds_04", 11, 9, [27., -13.], [10, 9, 8]),
+            ("clouds_stratus_01", 7, 5, [128., -6.], [6, 5, 4]),
+            ("clouds_stratus_02", 11, 9, [122., -5.], [10, 9, 8]),
+        ] {
+            let path = assets.join(format!("Sprite/{name}.asset"));
+            let mesh = cloud_mesh(&path).unwrap();
+            assert_eq!(mesh.vertices.len(), count, "{name}");
+            assert_eq!(mesh.indices.len(), triangles * 3, "{name}");
+            assert_eq!(mesh.vertices[0], first_vertex, "{name}");
+            assert_eq!(mesh.indices[..3], first_triangle, "{name}");
+            let text = std::fs::read_to_string(path).unwrap();
+            let (_, _, _, original) = parse_mesh(&text).unwrap();
+            let (px, py) = mesh_pivot(&text);
+            for (local, absolute) in mesh.vertices.into_iter().zip(original.verts) {
+                assert_eq!((local[0] + px, py - local[1]), absolute, "{name}");
+            }
+            assert_eq!(
+                mesh.indices
+                    .iter()
+                    .map(|&i| usize::from(i))
+                    .collect::<Vec<_>>(),
+                original.tris.into_iter().flatten().collect::<Vec<_>>(),
+                "{name}"
+            );
+        }
     }
 }

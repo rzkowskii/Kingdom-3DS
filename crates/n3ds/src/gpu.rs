@@ -30,11 +30,14 @@ use std::rc::Rc;
 
 use citro3d_sys as c3d;
 use ctru_sys as ctru;
+use scene::cloud_mesh::CloudMesh;
 use scene::cloud_shadow::{self, ATLAS_HEIGHT, ATLAS_WIDTH};
 use scene::render::{Color, Draw, Rect, Renderer};
 use scene::sheet::{PageFormat, Sheet};
 
 static SHADER: &[u8] = citro3d_macros::include_shader!("../shaders/sprite.v.pica");
+// The vertex shader normalizes screen-grid offsets by these dimensions.
+const _: () = assert!(ATLAS_WIDTH == 1024 && ATLAS_HEIGHT == 1024);
 
 /// Quads per frame (both screens). 16k quads = 2 MiB of vertices.
 const MAX_QUADS: usize = 16384;
@@ -58,8 +61,8 @@ struct Vertex {
     pos: [f32; 4],
     uv: [f32; 2],
     color: [u8; 4],
-    /// Pixel coordinates in the cloud exposure atlas.
-    cloud_uv: [u16; 2],
+    /// Offset from this eye's screen pixels to the cloud's exposure atlas tile.
+    cloud_uv: [i16; 2],
 }
 
 type Quad = [Vertex; 4];
@@ -82,8 +85,14 @@ enum Effect {
     Overlay(u32),
     /// Unlit cloud highlight RGB, packed RGBA8.
     Cloud(u32),
-    /// Cloud highlight with the per-texel exposure in texture unit 1.
+    /// Cloud highlight with per-screen-pixel exposure in texture unit 1.
     ShadowedCloud(u32),
+}
+
+enum RightCloudExposure {
+    Pending,
+    Allocated(Box<c3d::C3D_Tex>),
+    Unavailable,
 }
 
 /// A step of a screen's drawing, kept to replay for the right eye.
@@ -118,6 +127,7 @@ pub struct Gpu {
     page_hard: Vec<bool>,
     cloud_shadow: cloud_shadow::Pass,
     cloud_exposure: Option<Box<c3d::C3D_Tex>>,
+    right_cloud_exposure: RightCloudExposure,
     pub sheet: Rc<Sheet>,
     verts: *mut Vertex,
     indices: *mut u16,
@@ -181,6 +191,7 @@ unsafe fn insert_cloud_alpha(
     pass: &mut cloud_shadow::Pass,
     id: u32,
     sprite: &scene::sheet::Sprite,
+    mesh: Option<&CloudMesh>,
     tex: &mut c3d::C3D_Tex,
 ) -> Result<(), String> {
     let dims = tex.__bindgen_anon_2.__bindgen_anon_1;
@@ -208,7 +219,7 @@ unsafe fn insert_cloud_alpha(
             data[texel * 4]
         })
     });
-    pass.insert(id, sprite, alpha);
+    pass.insert(id, sprite, mesh, alpha);
     Ok(())
 }
 
@@ -246,8 +257,25 @@ unsafe fn upload_cloud_exposure(tex: &mut c3d::C3D_Tex, atlas: cloud_shadow::Atl
         }
     }
     let _ = ctru::GSPGPU_FlushDataCache(data.as_ptr().cast(), active as u32);
-    // Rebind after the CPU write to invalidate the GPU's texture cache.
-    c3d::C3D_TexBind(1, tex);
+}
+
+unsafe fn new_cloud_exposure() -> Option<Box<c3d::C3D_Tex>> {
+    let mut tex: Box<c3d::C3D_Tex> = Box::new(std::mem::zeroed());
+    if !c3d::C3D_TexInit(tex.as_mut(), ATLAS_WIDTH, ATLAS_HEIGHT, ctru::GPU_A8) {
+        return None;
+    }
+    tex.__bindgen_anon_1
+        .data
+        .cast::<u8>()
+        .write_bytes(255, usize::from(ATLAS_WIDTH) * usize::from(ATLAS_HEIGHT));
+    c3d::C3D_TexFlush(tex.as_mut());
+    c3d::C3D_TexSetFilter(tex.as_mut(), ctru::GPU_NEAREST, ctru::GPU_NEAREST);
+    c3d::C3D_TexSetWrap(
+        tex.as_mut(),
+        ctru::GPU_CLAMP_TO_EDGE,
+        ctru::GPU_CLAMP_TO_EDGE,
+    );
+    Some(tex)
 }
 
 impl Screen {
@@ -376,27 +404,15 @@ impl Gpu {
                         &mut cloud_shadow,
                         id,
                         sprite,
+                        sheet.cloud_mesh(id),
                         pages[usize::from(sprite.page)].as_mut(),
                     )?;
                 }
-                let mut tex: Box<c3d::C3D_Tex> = Box::new(std::mem::zeroed());
-                if c3d::C3D_TexInit(tex.as_mut(), ATLAS_WIDTH, ATLAS_HEIGHT, ctru::GPU_A8) {
-                    tex.__bindgen_anon_1
-                        .data
-                        .cast::<u8>()
-                        .write_bytes(255, usize::from(ATLAS_WIDTH) * usize::from(ATLAS_HEIGHT));
-                    c3d::C3D_TexFlush(tex.as_mut());
-                    c3d::C3D_TexSetFilter(tex.as_mut(), ctru::GPU_NEAREST, ctru::GPU_NEAREST);
-                    c3d::C3D_TexSetWrap(
-                        tex.as_mut(),
-                        ctru::GPU_CLAMP_TO_EDGE,
-                        ctru::GPU_CLAMP_TO_EDGE,
-                    );
-                    Some(tex)
-                } else {
+                let exposure = new_cloud_exposure();
+                if exposure.is_none() {
                     eprintln!("cloud shadows disabled: insufficient texture memory");
-                    None
                 }
+                exposure
             } else {
                 None
             };
@@ -466,6 +482,7 @@ impl Gpu {
                 page_hard,
                 cloud_shadow,
                 cloud_exposure,
+                right_cloud_exposure: RightCloudExposure::Pending,
                 sheet,
                 verts,
                 indices,
@@ -575,6 +592,13 @@ impl Gpu {
                 0.0,
             );
         }
+        let has_exposure =
+            if let RightCloudExposure::Allocated(tex) = &mut self.right_cloud_exposure {
+                unsafe { c3d::C3D_TexBind(1, tex.as_mut()) };
+                true
+            } else {
+                false
+            };
         self.unbind();
         for &c in &calls {
             match c {
@@ -589,6 +613,11 @@ impl Gpu {
                             continue;
                         };
                         state.page = Some(page);
+                    }
+                    if !has_exposure {
+                        if let Effect::ShadowedCloud(light) = state.effect {
+                            state.effect = Effect::Cloud(light);
+                        }
                     }
                     self.bind(state);
                     c3d::C3D_DrawElements(
@@ -974,24 +1003,13 @@ impl Gpu {
         uv: [(f32, f32); 4],
         colors: [Color; 4],
     ) {
-        self.quad_with_shadow(state, corners, uv, colors, [[0; 2]; 4]);
-    }
-
-    fn quad_with_shadow(
-        &mut self,
-        state: State,
-        corners: [(f32, f32); 4],
-        uv: [(f32, f32); 4],
-        colors: [Color; 4],
-        shadow_uv: [[u16; 2]; 4],
-    ) {
         let z = -0.999 + self.order as f32 * Z_STEP;
         self.order += 1;
         let q: Quad = [0, 1, 2, 3].map(|i| Vertex {
             pos: [corners[i].0, corners[i].1, z, self.depth],
             uv: [uv[i].0, uv[i].1],
             color: color(colors[i]),
-            cloud_uv: shadow_uv[i],
+            cloud_uv: [0; 2],
         });
         let opaque = !self.painter
             && !state.additive
@@ -1006,6 +1024,10 @@ impl Gpu {
             }
             return;
         }
+        self.translucent_quad(state, q);
+    }
+
+    fn translucent_quad(&mut self, state: State, q: Quad) {
         // In painter's order, so straight into the vertex buffer; a quad
         // with the same state as the one before extends its run.
         if self.quads >= MAX_QUADS {
@@ -1020,6 +1042,64 @@ impl Gpu {
         }
     }
 
+    /// Unity's tight sprite triangles and a separate screen-grid exposure mask.
+    fn cloud_sprite(&mut self, id: u32, at: (f32, f32), d: &Draw, light: Color) {
+        let sheet = Rc::clone(&self.sheet);
+        let s = sheet.get(id);
+        let geometry = cloud_shadow::Geometry::new(s, sheet.cloud_mesh(id));
+        let triangles = geometry.indices().as_chunks::<3>().0;
+        let z = -0.999 + self.order as f32 * Z_STEP;
+        self.order += 1;
+        if triangles.len() > MAX_QUADS - self.quads {
+            return;
+        }
+        let mask = if self.cloud_exposure.is_some() {
+            d.cloud_shadow
+                .and_then(|receiver| self.cloud_shadow.mask(receiver.index))
+        } else {
+            None
+        };
+        let cloud_uv = mask.map_or([0; 2], |mask| {
+            [
+                mask.tile[0] as i16 - mask.origin[0],
+                // The vertex shader inverts Y for the bottom-origin texture.
+                mask.tile[1] as i16 - mask.origin[1] - ATLAS_HEIGHT as i16,
+            ]
+        });
+        let light = u32::from_le_bytes(color(light));
+        let state = State {
+            page: Some(s.page),
+            additive: false,
+            smooth: false,
+            effect: if mask.is_some() {
+                Effect::ShadowedCloud(light)
+            } else {
+                Effect::Cloud(light)
+            },
+        };
+        let (pw, ph) = self.page_size[s.page as usize];
+        let depth = self.depth;
+        let tint = color(d.tint);
+        let vertex = |index: u16| {
+            let local = geometry.vertices()[usize::from(index)];
+            let [x, y] = cloud_shadow::screen_point(local, at, d);
+            Vertex {
+                pos: [x, y, z, depth],
+                uv: [
+                    (f32::from(s.x) + s.px + local[0]) / pw,
+                    1.0 - (f32::from(s.y) + s.py + local[1]) / ph,
+                ],
+                color: tint,
+                cloud_uv,
+            }
+        };
+        for &[a, b, c] in triangles {
+            let c = vertex(c);
+            // The fixed quad index buffer emits one real and one degenerate triangle.
+            self.translucent_quad(state, [vertex(a), vertex(b), c, c]);
+        }
+    }
+
     /// One sprite image (no recolour) at `at`.
     fn sprite_part(&mut self, id: u32, at: (f32, f32), d: &Draw, tint: Color) {
         let s = *self.sheet.get(id);
@@ -1031,21 +1111,7 @@ impl Gpu {
         let (ul, ur) = if d.flip { (u1, u0) } else { (u0, u1) };
         let (vt, vb) = if d.flip_y { (v1, v0) } else { (v0, v1) };
         let uv = [(ul, vt), (ur, vt), (ur, vb), (ul, vb)];
-        let shadow = d.cloud_shadow.filter(|&[x, y]| {
-            self.cloud_exposure.is_some()
-                && x <= ATLAS_WIDTH.saturating_sub(s.w)
-                && y <= ATLAS_HEIGHT.saturating_sub(s.h)
-                && s.w <= ATLAS_WIDTH
-                && s.h <= ATLAS_HEIGHT
-        });
-        let effect = if let Some(light) = d.cloud_light {
-            let light = u32::from_le_bytes(color(light));
-            if shadow.is_some() {
-                Effect::ShadowedCloud(light)
-            } else {
-                Effect::Cloud(light)
-            }
-        } else if let Some(overlay) = d.overlay.filter(|c| c.a > 0.0) {
+        let effect = if let Some(overlay) = d.overlay.filter(|c| c.a > 0.0) {
             // The PowerSprite2 overlay follows recoloring and lighting.
             Effect::Overlay(u32::from_le_bytes(color(overlay)))
         } else {
@@ -1053,23 +1119,12 @@ impl Gpu {
         };
         let state = State {
             page: Some(s.page),
-            additive: d.additive && d.cloud_light.is_none(),
+            additive: d.additive,
             effect,
             smooth: d.smooth
-                && d.cloud_light.is_none()
                 && (d.scale != 1.0 || d.angle != 0.0 || d.affine != [1.0, 0.0, 0.0, 1.0]),
         };
-        let shadow_uv = shadow.map_or([[0; 2]; 4], |[x, y]| {
-            let (left, right) = if d.flip { (x + s.w, x) } else { (x, x + s.w) };
-            let (top, bottom) = (ATLAS_HEIGHT - y, ATLAS_HEIGHT - y - s.h);
-            let (top, bottom) = if d.flip_y {
-                (bottom, top)
-            } else {
-                (top, bottom)
-            };
-            [[left, top], [right, top], [right, bottom], [left, bottom]]
-        });
-        self.quad_with_shadow(state, corners, uv, [tint; 4], shadow_uv);
+        self.quad(state, corners, uv, [tint; 4]);
     }
 
     fn solid_rect(&mut self, r: Rect, top: Color, bottom: Color, additive: bool) {
@@ -1098,11 +1153,30 @@ impl Renderer for Gpu {
         let Some(tex) = &mut self.cloud_exposure else {
             return false;
         };
-        let Some(atlas) = self.cloud_shadow.prepare(camera, clouds) else {
+        let half = self.stereo / 2.0;
+        let Some(atlas) = self.cloud_shadow.prepare_left(camera, clouds, half) else {
             return false;
         };
-        // The frame's synchronous begin has finished GPU use of the old atlas.
+        // The frame's synchronous begin has finished GPU use of both old atlases.
         unsafe { upload_cloud_exposure(tex.as_mut(), atlas) };
+        if half > 0.0 {
+            if matches!(self.right_cloud_exposure, RightCloudExposure::Pending) {
+                // Keep the second texture out of the mono allocation budget.
+                self.right_cloud_exposure = match unsafe { new_cloud_exposure() } {
+                    Some(tex) => RightCloudExposure::Allocated(tex),
+                    None => {
+                        eprintln!("right-eye cloud shadows disabled: insufficient texture memory");
+                        RightCloudExposure::Unavailable
+                    }
+                };
+            }
+            if let RightCloudExposure::Allocated(right) = &mut self.right_cloud_exposure {
+                let atlas = self.cloud_shadow.prepare_right(camera, clouds, half);
+                unsafe { upload_cloud_exposure(right.as_mut(), atlas) };
+            }
+        }
+        // Rebind after upload to invalidate the GPU's texture cache.
+        unsafe { c3d::C3D_TexBind(1, tex.as_mut()) };
         true
     }
 
@@ -1112,11 +1186,12 @@ impl Renderer for Gpu {
     }
 
     fn sprite(&mut self, id: u32, at: (f32, f32), d: Draw) {
-        let masks = self.sheet.get(id).masks;
-        self.sprite_part(id, at, &d, d.tint);
-        if d.cloud_light.is_some() {
+        if let Some(light) = d.cloud_light {
+            self.cloud_sprite(id, at, &d, light);
             return;
         }
+        let masks = self.sheet.get(id).masks;
+        self.sprite_part(id, at, &d, d.tint);
         // orig: Custom/PowerSprite2's recolour: keyed pixels × recolorA / recolorB.
         let (a, b) = d.recolor.unwrap_or((Color::WHITE, Color::WHITE));
         for (m, c) in masks.into_iter().zip([a, b]) {

@@ -56,6 +56,12 @@ fn load() -> Result<(WorldData, u32, Sheet), String> {
         .map_err(|e| format!("sheet.bin: {e}"))?;
     sheet.validate()?;
     sheet.link(&world.sprites);
+    let mesh_file = scene::cloud_mesh::FILE_NAME;
+    match std::fs::read(format!("{ROMFS}/{mesh_file}")) {
+        Ok(bytes) => sheet.link_cloud_meshes(&world, &bytes)?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("{mesh_file}: {e}")),
+    }
     Ok((world, world_id, sheet))
 }
 

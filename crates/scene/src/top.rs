@@ -310,7 +310,8 @@ pub fn draw_list(s: &Session) -> Vec<((i16, i16, f32), DrawItem)> {
 
 struct CloudDraw {
     sample: CloudSample,
-    shadow: Option<[u16; 2]>,
+    at: (f32, f32),
+    shadow: Option<cloud_shadow::Receiver>,
 }
 
 fn draw_list_with_effects(
@@ -1931,7 +1932,7 @@ fn draw_world<R: Renderer>(c: &mut Ctx<R>) {
 
     let game_z = layer_z(&s.world);
     let particles: Vec<_> = s.boulder_particles.samples(&s.world).collect();
-    let clouds = cloud_draws(c, &light);
+    let clouds = cloud_draws(c, &light, game_z);
     let items = draw_list_with_effects(s, &particles, &clouds);
     c.lights = items
         .iter()
@@ -1977,13 +1978,12 @@ fn draw_world<R: Renderer>(c: &mut Ctx<R>) {
             DrawItem::Stars => draw_stars(c),
             DrawItem::Cloud(i) => {
                 let p = clouds[i].sample;
-                let at = layer_to_screen(s, p.position[0], p.position[1], 0.0);
                 let mut draw = Draw::tint(p.tint)
                     .flip(p.flip)
                     .affine([p.scale[0], 0.0, 0.0, p.scale[1]])
                     .cloud_light(p.light);
                 draw.cloud_shadow = clouds[i].shadow;
-                c.world(p.sprite, at, draw);
+                c.world(p.sprite, clouds[i].at, draw);
             }
             DrawItem::Grass(i) => draw_grass(c, i),
             DrawItem::Animal(i) => draw_animal(c, i),
@@ -2041,7 +2041,7 @@ fn draw_world<R: Renderer>(c: &mut Ctx<R>) {
     }
 }
 
-fn cloud_draws(c: &mut Ctx<'_, impl Renderer>, light: &Light) -> Vec<CloudDraw> {
+fn cloud_draws(c: &mut Ctx<'_, impl Renderer>, light: &Light, game_z: f32) -> Vec<CloudDraw> {
     let s = c.s;
     let Some(def) = &s.world.clouds else {
         return Vec::new();
@@ -2057,25 +2057,32 @@ fn cloud_draws(c: &mut Ctx<'_, impl Renderer>, light: &Light) -> Vec<CloudDraw> 
         let extent = sprite.px.abs().max((f32::from(sprite.w) - sprite.px).abs());
         // Keep a stereo margin. Offscreen casters can still shade visible clouds.
         let visible = p.position[0].abs() * PPU <= W / 2.0 + extent * p.scale[0] + 16.0;
-        let mut slot = None;
+        let at = layer_to_screen(s, p.position[0], p.position[1], 0.0);
+        let mut shadow = None;
         if visible {
             if p.kind == CloudKind::Cumulus && p.light.r.max(p.light.g).max(p.light.b) > 0.0 {
-                slot = cloud_shadow::atlas_slot(receivers, sprite);
-                receivers += usize::from(slot.is_some());
+                shadow = Some(cloud_shadow::Receiver {
+                    index: receivers,
+                    position: p.position,
+                });
+                receivers += 1;
             }
             draws.push(CloudDraw {
                 sample: p,
-                shadow: slot,
+                at,
+                shadow,
             });
         }
-        if slot.is_some() || p.tint.a >= 0.5 {
+        if shadow.is_some() || p.tint.a >= 0.5 {
             sprites.push(cloud_shadow::Sprite {
                 id,
                 position: p.position,
                 scale: p.scale,
                 flip: p.flip,
                 opacity: p.tint.a,
-                slot,
+                screen: [at.0, at.1],
+                stereo_depth: stereo_depth(p.position[2] - game_z),
+                receiver: shadow.map(|r| r.index),
             });
         }
     }

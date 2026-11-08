@@ -4,7 +4,8 @@
 use std::path::Path;
 use std::rc::Rc;
 
-use ::scene::cloud_shadow::{self, ATLAS_HEIGHT, ATLAS_WIDTH};
+use ::scene::cloud_mesh;
+use ::scene::cloud_shadow::{self, Geometry, MAP_H, MAP_W};
 use ::scene::render::{Color, Draw, Rect, Renderer};
 use ::scene::sheet::Sheet;
 use game::data::WorldData;
@@ -29,7 +30,8 @@ pub struct Assets {
     recolor: Material,
     cloud: Material,
     cloud_pass: cloud_shadow::Pass,
-    cloud_atlas: Option<CloudAtlas>,
+    cloud_depth: Option<CloudDepth>,
+    shadow_camera: Option<cloud_shadow::Camera>,
     /// Desktop capture fixtures can compare the same frame at full exposure.
     pub cloud_shadows_enabled: bool,
     /// Additive blending (glows, PostFX add color).
@@ -40,49 +42,69 @@ pub struct Assets {
     pub previous: Option<Texture2D>,
 }
 
-/// Single-channel exposure atlas. Macroquad's wrapper for a raw texture does
-/// not own its allocation.
-struct CloudAtlas(Texture2D);
+const DEPTH_WIDTH: u32 = MAP_W as u32;
+const DEPTH_HEIGHT: u32 = MAP_H as u32;
+const DEPTH_MAX: f32 = 16_777_215.0;
 
-impl CloudAtlas {
+/// The receiver samples the shadow camera's encoded depth in its fragment
+/// shader. Macroquad's wrapper for a raw texture does not own its allocation.
+struct CloudDepth {
+    texture: Texture2D,
+    bytes: Vec<u8>,
+}
+
+impl CloudDepth {
     fn new() -> Self {
         let texture = unsafe { mq::get_internal_gl() }.quad_context.new_texture(
             TextureAccess::Static,
             TextureSource::Empty,
             TextureParams {
-                format: TextureFormat::Alpha,
-                width: u32::from(ATLAS_WIDTH),
-                height: u32::from(ATLAS_HEIGHT),
+                format: TextureFormat::RGBA8,
+                width: DEPTH_WIDTH,
+                height: DEPTH_HEIGHT,
                 min_filter: FilterMode::Nearest,
                 mag_filter: FilterMode::Nearest,
                 ..Default::default()
             },
         );
-        Self(Texture2D::from_miniquad_texture(texture))
+        Self {
+            texture: Texture2D::from_miniquad_texture(texture),
+            bytes: vec![0; (DEPTH_WIDTH * DEPTH_HEIGHT * 4) as usize],
+        }
     }
 
-    fn upload(&self, atlas: cloud_shadow::Atlas<'_>) {
-        let id = self.0.raw_miniquad_id();
+    fn upload(&mut self, depth: &[f32]) {
+        encode_depth(depth, &mut self.bytes);
+        let id = self.texture.raw_miniquad_id();
         let mut gl = unsafe { mq::get_internal_gl() };
-        // Finish any draws using the previous mask before replacing it.
+        // Finish any draws using the previous map before replacing it.
         gl.flush();
         gl.quad_context.texture_update_part(
             id,
             0,
             0,
-            i32::from(ATLAS_WIDTH),
-            i32::from(atlas.height),
-            atlas.pixels,
+            DEPTH_WIDTH as i32,
+            DEPTH_HEIGHT as i32,
+            &self.bytes,
         );
     }
 }
 
-impl Drop for CloudAtlas {
+impl Drop for CloudDepth {
     fn drop(&mut self) {
-        let id = self.0.raw_miniquad_id();
+        let id = self.texture.raw_miniquad_id();
         unsafe { mq::get_internal_gl() }
             .quad_context
             .delete_texture(id);
+    }
+}
+
+pub(crate) fn encode_depth(depth: &[f32], bytes: &mut [u8]) {
+    assert_eq!(bytes.len(), depth.len() * 4);
+    for (&value, out) in depth.iter().zip(bytes.as_chunks_mut::<4>().0) {
+        let word = (value.clamp(0.0, 1.0) * DEPTH_MAX).round() as u32;
+        let [_, r, g, b] = word.to_be_bytes();
+        *out = [r, g, b, 255];
     }
 }
 
@@ -122,13 +144,13 @@ void main() {
 }
 "#;
 
-const CLOUD_VS: &str = r#"#version 100
+pub(crate) const CLOUD_VS: &str = r#"#version 100
 attribute vec3 position;
 attribute vec2 texcoord;
 attribute vec4 color0;
 attribute vec4 normal;
 varying highp vec2 uv;
-varying highp vec3 shadow;
+varying highp vec4 shadow;
 varying lowp vec4 color;
 uniform mat4 Model;
 uniform mat4 Projection;
@@ -136,18 +158,39 @@ void main() {
     gl_Position = Projection * Model * vec4(position, 1);
     color = color0 / 255.0;
     uv = texcoord;
-    shadow = normal.xyz;
+    shadow = normal;
 }
 "#;
 
-const CLOUD_FS: &str = r#"#version 100
+pub(crate) const CLOUD_FS: &str = r#"#version 100
 precision lowp float;
 varying highp vec2 uv;
-varying highp vec3 shadow;
+varying highp vec4 shadow;
 varying vec4 color;
 uniform sampler2D Texture;
-uniform sampler2D CloudExposure;
+uniform highp sampler2D CloudDepth;
 uniform vec4 CloudLight;
+const highp vec2 depthSize = vec2(512.0, 256.0);
+const highp vec3 depthWeights = vec3(65536.0, 256.0, 1.0);
+
+highp float depthTexel(highp vec2 pixel) {
+    highp vec2 coord = (pixel + 0.5) / depthSize;
+    highp vec3 encoded = texture2D(CloudDepth, coord).rgb;
+    return dot(encoded, depthWeights) / 65793.0;
+}
+
+highp float sampleDepth(highp vec2 pixel) {
+    // Filter decoded RGB packing in the encoded camera-depth domain.
+    highp vec2 corner = floor(pixel);
+    highp vec2 t = pixel - corner;
+    highp float a = mix(depthTexel(corner),
+                        depthTexel(corner + vec2(1.0, 0.0)), t.x);
+    highp float b = mix(depthTexel(corner + vec2(0.0, 1.0)),
+                        depthTexel(corner + vec2(1.0, 1.0)), t.x);
+    highp float depth = mix(a, b, t.y);
+    return 1.0 / (depth * (1.0 / 20.0 - 1.0 / 0.3) + 1.0 / 0.3);
+}
+
 void main() {
     vec4 t = texture2D(Texture, uv);
     if (t.a == 0.0) {
@@ -155,7 +198,14 @@ void main() {
     }
     // The atlas stores (1 + source alpha) / 2 after the PC alpha cutoff.
     // Its complement is the unlit highlight's original alpha coefficient.
-    float exposure = shadow.z > 0.5 ? texture2D(CloudExposure, shadow.xy).a : 1.0;
+    float exposure = 1.0;
+    if (shadow.w > 0.5 && t.a < 1.0) {
+        highp vec2 pixel = shadow.xy;
+        highp float a = sampleDepth(pixel);
+        highp float b = sampleDepth(pixel + vec2(0.0, 2.0));
+        exposure = (shadow.z - a < 0.05 ? 0.5 : 0.0)
+                 + (shadow.z - b < 0.05 ? 0.5 : 0.0);
+    }
     gl_FragColor = vec4(t.rgb * color.rgb + (1.0 - t.a) * CloudLight.rgb * exposure,
                         t.a * color.a);
 }
@@ -200,6 +250,12 @@ impl Assets {
             &read("font.json")?,
         )?;
         sheet.link(&world.sprites);
+        let mesh_path = dir.join(cloud_mesh::FILE_NAME);
+        match std::fs::read(&mesh_path) {
+            Ok(bytes) => sheet.link_cloud_meshes(world, &bytes)?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(format!("{}: {e}", mesh_path.display())),
+        }
         let cloud_sprites = world
             .clouds
             .iter()
@@ -233,7 +289,7 @@ impl Assets {
                             .iter()
                             .map(|pixel| pixel[3])
                     });
-                    cloud_pass.insert(id, s, alpha);
+                    cloud_pass.insert(id, s, sheet.cloud_mesh(id), alpha);
                 }
             }
             let soft = Texture2D::from_image(&image);
@@ -273,7 +329,7 @@ impl Assets {
             MaterialParams {
                 uniforms: vec![UniformDesc::new("CloudLight", UniformType::Float4)],
                 pipeline_params: blend(BlendFactor::OneMinusValue(BlendValue::SourceAlpha)),
-                textures: vec!["CloudExposure".into()],
+                textures: vec!["CloudDepth".into()],
             },
         )
         .map_err(|e| e.to_string())?;
@@ -299,12 +355,12 @@ impl Assets {
             },
         )
         .map_err(|e| e.to_string())?;
-        let cloud_atlas = (!cloud_sprites.is_empty()).then(CloudAtlas::new);
+        let cloud_depth = (!cloud_sprites.is_empty()).then(CloudDepth::new);
         cloud.set_texture(
-            "CloudExposure",
-            cloud_atlas
+            "CloudDepth",
+            cloud_depth
                 .as_ref()
-                .map_or_else(Texture2D::empty, |atlas| atlas.0.clone()),
+                .map_or_else(Texture2D::empty, |map| map.texture.clone()),
         );
         Ok(Assets {
             pages,
@@ -314,11 +370,47 @@ impl Assets {
             recolor,
             cloud,
             cloud_pass,
-            cloud_atlas,
+            cloud_depth,
+            shadow_camera: None,
             cloud_shadows_enabled: true,
             additive,
             previous: None,
         })
+    }
+
+    fn cloud_sprite(&self, id: u32, at: (f32, f32), d: &Draw, light: Color) {
+        let sprite = self.sheet.get(id);
+        let geometry = Geometry::new(sprite, self.sheet.cloud_mesh(id));
+        let texture = &self.pages[usize::from(sprite.page)];
+        let shadow = self.shadow_camera.zip(d.cloud_shadow);
+        let color = mc(d.tint);
+        let vertices = geometry
+            .vertices()
+            .iter()
+            .map(|&local| {
+                let [x, y] = cloud_shadow::screen_point(local, at, d);
+                // Keep the original UV attached to its vertex when mirroring.
+                let u = (f32::from(sprite.x) + sprite.px + local[0]) / texture.width();
+                let v = (f32::from(sprite.y) + sprite.py + local[1]) / texture.height();
+                let mut vertex = Vertex::new(x, y, 0.0, u, v, color);
+                if let Some((camera, receiver)) = shadow {
+                    let scale = [d.affine[0] * d.scale, d.affine[3] * d.scale];
+                    let [x, y, z] =
+                        cloud_shadow::world_point(local, receiver.position, scale, d.flip);
+                    let [u, v, clip_z] = camera.project(x, y, z);
+                    vertex.normal = mq::vec4(u, v, clip_z, 1.0);
+                }
+                vertex
+            })
+            .collect();
+        gl_use_material(&self.cloud);
+        self.cloud.set_uniform("CloudLight", mc(light).to_vec());
+        draw_mesh(&Mesh {
+            vertices,
+            indices: geometry.indices().to_vec(),
+            texture: Some(texture.clone()),
+        });
+        gl_use_default_material();
     }
 }
 
@@ -347,26 +439,29 @@ impl Renderer for Assets {
         camera: cloud_shadow::Camera,
         clouds: &[cloud_shadow::Sprite],
     ) -> bool {
-        let Some(atlas) = self
-            .cloud_atlas
-            .as_ref()
+        self.shadow_camera = None;
+        let Some(texture) = self
+            .cloud_depth
+            .as_mut()
             .filter(|_| self.cloud_shadows_enabled)
         else {
             return false;
         };
-        let Some(exposure) = self.cloud_pass.prepare(camera, clouds) else {
+        let Some(depth) = self.cloud_pass.prepare_depth(camera, clouds) else {
             return false;
         };
-        atlas.upload(exposure);
+        texture.upload(depth);
+        self.shadow_camera = Some(camera);
         true
     }
 
     fn sprite(&mut self, id: u32, at: (f32, f32), d: Draw) {
-        let s = *self.sheet.get(id);
         if let Some(light) = d.cloud_light {
-            gl_use_material(&self.cloud);
-            self.cloud.set_uniform("CloudLight", mc(light).to_vec());
-        } else if d.recolor.is_some() || d.overlay.is_some() {
+            self.cloud_sprite(id, at, &d, light);
+            return;
+        }
+        let s = *self.sheet.get(id);
+        if d.recolor.is_some() || d.overlay.is_some() {
             let (a, b) = d.recolor.unwrap_or((Color::WHITE, Color::WHITE));
             gl_use_material(&self.recolor);
             self.recolor.set_uniform("RecolorA", mc(a).to_vec());
@@ -378,12 +473,8 @@ impl Renderer for Assets {
         } else if d.additive {
             gl_use_material(&self.additive);
         }
-        let page = if d.smooth && d.cloud_light.is_none() {
-            &self.smooth
-        } else {
-            &self.pages
-        };
-        if d.affine != [1.0, 0.0, 0.0, 1.0] || d.flip_y || d.cloud_light.is_some() {
+        let page = if d.smooth { &self.smooth } else { &self.pages };
+        if d.affine != [1.0, 0.0, 0.0, 1.0] || d.flip_y {
             let corners = ::scene::render::sprite_corners(&s, at, &d);
             let texture = &page[s.page as usize];
             let (pw, ph) = (texture.width(), texture.height());
@@ -392,20 +483,10 @@ impl Renderer for Assets {
             let (ul, ur) = if d.flip { (u1, u0) } else { (u0, u1) };
             let (vt, vb) = if d.flip_y { (v1, v0) } else { (v0, v1) };
             let uv = [(ul, vt), (ur, vt), (ur, vb), (ul, vb)];
-            let shadow_uv = d
-                .cloud_shadow
-                .map(|tile| shadow_corners(tile, [s.w, s.h], d.flip, d.flip_y));
             let vertices = corners
                 .into_iter()
                 .zip(uv)
-                .enumerate()
-                .map(|(i, ((x, y), (u, v)))| {
-                    let mut v = Vertex::new(x, y, 0.0, u, v, mc(d.tint));
-                    if let Some(uv) = shadow_uv {
-                        v.normal = mq::vec4(uv[i][0], uv[i][1], 1.0, 0.0);
-                    }
-                    v
-                })
+                .map(|((x, y), (u, v))| Vertex::new(x, y, 0.0, u, v, mc(d.tint)))
                 .collect();
             draw_mesh(&Mesh {
                 vertices,
@@ -435,7 +516,7 @@ impl Renderer for Assets {
                 },
             );
         }
-        if d.cloud_light.is_some() || d.recolor.is_some() || d.overlay.is_some() || d.additive {
+        if d.recolor.is_some() || d.overlay.is_some() || d.additive {
             gl_use_default_material();
         }
     }
@@ -531,41 +612,22 @@ impl Renderer for Assets {
     }
 }
 
-fn shadow_corners(tile: [u16; 2], size: [u16; 2], flip: bool, flip_y: bool) -> [[f32; 2]; 4] {
-    let [x, y] = tile.map(f32::from);
-    let [w, h] = size.map(f32::from);
-    let u0 = x / f32::from(ATLAS_WIDTH);
-    let u1 = (x + w) / f32::from(ATLAS_WIDTH);
-    let v0 = y / f32::from(ATLAS_HEIGHT);
-    let v1 = (y + h) / f32::from(ATLAS_HEIGHT);
-    let (left, right) = if flip { (u1, u0) } else { (u0, u1) };
-    let (top, bottom) = if flip_y { (v1, v0) } else { (v0, v1) };
-    [[left, top], [right, top], [right, bottom], [left, bottom]]
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn exposure_tile_uvs_follow_both_source_flips() {
-        let tile = [64, 128];
-        let size = [32, 16];
-        let left = 64.0 / 512.0;
-        let right = 96.0 / 512.0;
-        let top = 128.0 / 1024.0;
-        let bottom = 144.0 / 1024.0;
+    fn depth_upload_round_trips_24_bit_samples_in_row_order() {
+        let depth = [0.0, 1.0, 0.5, 0.975_002, 0.993_261, 0.975_017];
+        let mut bytes = [0; 24];
+        encode_depth(&depth, &mut bytes);
         assert_eq!(
-            shadow_corners(tile, size, false, false),
-            [[left, top], [right, top], [right, bottom], [left, bottom]],
+            &bytes[..12],
+            &[0, 0, 0, 255, 255, 255, 255, 255, 128, 0, 0, 255]
         );
-        assert_eq!(
-            shadow_corners(tile, size, true, false),
-            [[right, top], [left, top], [left, bottom], [right, bottom]],
-        );
-        assert_eq!(
-            shadow_corners(tile, size, false, true),
-            [[left, bottom], [right, bottom], [right, top], [left, top]],
-        );
+        for (actual, [r, g, b, _]) in depth.iter().zip(bytes.as_chunks::<4>().0) {
+            let decoded = u32::from_be_bytes([0, *r, *g, *b]) as f32 / DEPTH_MAX;
+            assert!((actual - decoded).abs() <= 1.0 / DEPTH_MAX);
+        }
     }
 }

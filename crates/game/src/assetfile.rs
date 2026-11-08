@@ -13,6 +13,7 @@ const HEADER: usize = 10;
 pub enum Kind {
     World,
     Sheet,
+    CloudMeshes,
 }
 
 impl Kind {
@@ -20,6 +21,7 @@ impl Kind {
         match self {
             Self::World => *b"KNLW",
             Self::Sheet => *b"KNLS",
+            Self::CloudMeshes => *b"KNLC",
         }
     }
 }

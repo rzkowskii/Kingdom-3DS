@@ -3,10 +3,12 @@
 //! by index. Desktop reads `tools/extract`'s JSON; the 3DS reads the packed
 //! `sheet.bin` that `pack3ds` writes (with recolour masks split out).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::hash::{BuildHasherDefault, Hasher};
 
 use serde::{Deserialize, Serialize};
+
+use crate::cloud_mesh::{CloudMesh, CloudMeshes};
 
 /// FNV-1a: name lookups happen hundreds of times a frame, and the default
 /// SipHash is slow on the 3DS's ARM11.
@@ -177,6 +179,8 @@ pub struct Sheet {
     world: Vec<Option<u32>>,
     #[serde(skip)]
     glyph_index: Map<char, (Option<u32>, f32)>,
+    #[serde(skip)]
+    cloud_meshes: Map<u32, CloudMesh>,
 }
 
 impl Sheet {
@@ -224,6 +228,49 @@ impl Sheet {
             .map(|n| self.index.get(n).copied())
             .collect();
         self.glyph_index = self.font.glyphs.iter().map(|g| (g.0, (g.1, g.2))).collect();
+        self.cloud_meshes.clear();
+    }
+
+    /// Attach authored geometry after linking the world and sheet sprite IDs.
+    pub fn link_cloud_meshes(
+        &mut self,
+        world: &game::data::WorldData,
+        bytes: &[u8],
+    ) -> Result<(), String> {
+        let meshes: CloudMeshes =
+            game::assetfile::decode(game::assetfile::Kind::CloudMeshes, bytes)
+                .map_err(|e| e.to_string())?;
+        let mut expected: HashSet<_> = world
+            .clouds
+            .iter()
+            .flat_map(game::data::CloudsDef::sprite_ids)
+            .collect();
+        let mut linked = Map::default();
+        for (world_id, mesh) in meshes.entries {
+            let id = self
+                .world(world_id)
+                .filter(|_| expected.remove(&world_id))
+                .ok_or_else(|| format!("unexpected cloud mesh sprite ID {world_id}"))?;
+            if !self
+                .sprites
+                .get(id as usize)
+                .is_some_and(|sprite| mesh.valid_for(sprite))
+                || linked.insert(id, mesh).is_some()
+            {
+                return Err(format!(
+                    "invalid cloud mesh geometry for sprite ID {world_id}"
+                ));
+            }
+        }
+        if !expected.is_empty() {
+            return Err("cloud mesh data does not cover all authored variants".into());
+        }
+        self.cloud_meshes = linked;
+        Ok(())
+    }
+
+    pub fn cloud_mesh(&self, id: u32) -> Option<&CloudMesh> {
+        self.cloud_meshes.get(&id)
     }
 
     /// A character's sprite (none for spaces) and advance.

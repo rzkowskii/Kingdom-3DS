@@ -23,10 +23,10 @@ with three PICA200 texture-combiner stages. The water uses the same shaded
 clouds from the normal reflection capture. The existing v8 world and sheet
 remain byte-identical, so saves from the cloud-rendering build still load.
 
-The receiver uses the port's sprite quads and nearest exposure masks. The PC
-evaluates exposure per fragment on its tight sprite meshes. The depth math
-follows the recovered D3D9 pass. The original D3D11 depth binding was inspected
-statically, with no runtime depth readback.
+This first shadow build used sprite quads and source-texel exposure masks. The
+next pass uses the [PC meshes and per-fragment interpolation](p10-tight-cloud-meshes.md).
+The depth math follows the recovered D3D9 pass. The original D3D11 depth
+binding was inspected statically, with no runtime depth readback.
 
 ## Evidence and validation
 

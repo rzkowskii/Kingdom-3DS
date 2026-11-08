@@ -12,6 +12,7 @@
 //! - `scenes/{main,blocks}.json`, `prefabs.json`, `data.json`: object trees
 //!   and ScriptableObjects with all serialized fields (see `scenes.rs`).
 //! - `world.bin`: versioned `game::data::WorldData` envelope (postcard payload).
+//! - `cloud-meshes.bin`: authored tight sprite meshes keyed by world sprite ID.
 
 mod audio;
 mod boulder_fx;
@@ -23,7 +24,7 @@ mod sprites;
 mod world;
 mod yaml;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -246,20 +247,33 @@ fn export_scenes(
     if !world.transforms_valid() {
         return Err("invalid extracted transform hierarchy".into());
     }
-    let mut cloud_names: HashSet<_> = world
+    let mut cloud_ids: HashMap<_, _> = world
         .clouds
         .iter()
         .flat_map(game::data::CloudsDef::sprite_ids)
-        .map(|id| world.sprites[usize::from(id)].as_str())
+        .map(|id| (world.sprites[usize::from(id)].as_str(), id))
         .collect();
+    let mut meshes = scene::cloud_mesh::CloudMeshes::default();
     for sprite in &mut sheet.sprites {
-        if cloud_names.remove(sprite.name.as_str()) {
+        if let Some(id) = cloud_ids.remove(sprite.name.as_str()) {
+            let (path, _) = sheet
+                .names_by_path
+                .iter()
+                .find(|(_, name)| **name == sprite.name)
+                .ok_or_else(|| format!("missing source path for cloud sprite {}", sprite.name))?;
+            meshes
+                .entries
+                .push((id, sprites::cloud_mesh(&assets.join(path))?));
             sprites::bake_cloud_coverage(&mut sprite.img);
         }
     }
-    if !cloud_names.is_empty() {
+    if !cloud_ids.is_empty() {
         return Err("missing cloud sprites in the cut sheet".into());
     }
+    meshes.entries.sort_by_key(|&(id, _)| id);
+    let bytes = game::assetfile::encode(game::assetfile::Kind::CloudMeshes, &meshes)
+        .map_err(|e| e.to_string())?;
+    std::fs::write(out.join(scene::cloud_mesh::FILE_NAME), bytes).map_err(|e| e.to_string())?;
     pack::write_pages(sheet, &out.join("sprites"), &out.join("sprites.json"))
         .map_err(|e| format!("packing: {e}"))?;
     audio::convert(assets, out, &mut world.audio, &clip_paths)?;

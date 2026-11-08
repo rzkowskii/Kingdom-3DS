@@ -71,8 +71,8 @@ pub struct Draw {
     /// ShadowReceiver material with coverage baked into the cloud sprite's alpha.
     /// RGB is the light after applying the cloud's shadow exposure. Alpha is unused.
     pub cloud_light: Option<Color>,
-    /// Top-left of the cloud's exposure mask in the dynamic atlas.
-    pub cloud_shadow: Option<[u16; 2]>,
+    /// Receiver pose and index in the prepared cloud shadow pass.
+    pub cloud_shadow: Option<crate::cloud_shadow::Receiver>,
     pub additive: bool,
     /// Filtered smoothly when scaled (glows); everything else stays pixel-sharp.
     pub smooth: bool,

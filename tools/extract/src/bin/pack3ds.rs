@@ -8,7 +8,7 @@
 //!   run on the GPU: the keyed pixels of each sprite become two extra mask
 //!   sprites that the renderer tints separately.
 //! - Pages go through `tex3ds` into `.t3x`; the sheet (sprites, clips, font)
-//!   becomes `sheet.bin`; `world.bin` is copied as is.
+//!   becomes `sheet.bin`; `world.bin` and `cloud-meshes.bin` are copied as is.
 //! - The sound clips (`audio/*.adp`, ~100 MB) go on the SD card instead, so
 //!   the `.3dsx` stays small: into `sdcard/3ds/kingdom-3ds/audio` beside the
 //!   romfs folder, to copy onto the card's root once.
@@ -179,11 +179,23 @@ fn run(src: &Path, out: &Path) -> Result<(), String> {
     let read = |n: &str| {
         std::fs::read_to_string(src.join(n)).map_err(|e| format!("{}: {e}", src.join(n).display()))
     };
-    let sheet = Sheet::from_json(
+    let mut sheet = Sheet::from_json(
         &read("sprites.json")?,
         &read("clips.json")?,
         &read("font.json")?,
     )?;
+    let cloud_mesh_file = scene::cloud_mesh::FILE_NAME;
+    let cloud_meshes = match std::fs::read(src.join(cloud_mesh_file)) {
+        Ok(bytes) => {
+            sheet.link(&world.sprites);
+            sheet
+                .link_cloud_meshes(&world, &bytes)
+                .map_err(|e| format!("{cloud_mesh_file}: {e}"))?;
+            Some(bytes)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(format!("{cloud_mesh_file}: {e}")),
+    };
     let cloud_sprites: HashSet<_> = world
         .clouds
         .iter()
@@ -262,6 +274,11 @@ fn run(src: &Path, out: &Path) -> Result<(), String> {
     // Trim each piece to its visible pixels (masks especially are mostly
     // empty); the pivot moves with the trim.
     for p in &mut pieces {
+        // Keep the original cloud crop so its authored vertex UVs cannot
+        // land in a neighbouring sprite after alpha-only trimming.
+        if sheet.cloud_mesh(p.sprite as u32).is_some() {
+            continue;
+        }
         let (w, h) = (p.img.w, p.img.h);
         let alpha = |x: u32, y: u32| p.img.px[((y * w + x) * 4 + 3) as usize] != 0;
         let rows: Vec<u32> = (0..h).filter(|&y| (0..w).any(|x| alpha(x, y))).collect();
@@ -424,6 +441,16 @@ fn run(src: &Path, out: &Path) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     std::fs::write(out.join("sheet.bin"), bin).map_err(|e| e.to_string())?;
     std::fs::write(out.join("world.bin"), &world_bytes).map_err(|e| format!("world.bin: {e}"))?;
+    let mesh_path = out.join(cloud_mesh_file);
+    if let Some(bytes) = cloud_meshes {
+        std::fs::write(mesh_path, bytes).map_err(|e| format!("{cloud_mesh_file}: {e}"))?;
+    } else {
+        match std::fs::remove_file(mesh_path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(format!("{cloud_mesh_file}: {e}")),
+        }
+    }
     let sd = out
         .parent()
         .unwrap_or(Path::new("."))

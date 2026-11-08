@@ -7,6 +7,7 @@ pub mod boulder_fx;
 pub mod camera;
 #[cfg(feature = "clipfile")]
 pub mod clipfile;
+pub mod cloud_mesh;
 pub mod cloud_shadow;
 pub mod clouds;
 pub mod heraldry;
