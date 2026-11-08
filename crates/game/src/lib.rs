@@ -3,6 +3,9 @@
 
 extern crate alloc;
 
+pub mod animation;
+#[cfg(feature = "save")]
+pub mod assetfile;
 pub mod autopilot;
 pub mod bag;
 pub mod boat;
@@ -13,6 +16,7 @@ pub mod data;
 pub mod director;
 pub mod dog;
 pub mod farm;
+pub mod flight;
 pub mod grass;
 pub mod greed;
 pub mod hermits;
@@ -26,6 +30,7 @@ pub mod payable;
 pub mod payment;
 pub mod prof;
 pub mod progress;
+pub mod recoil;
 pub mod rng;
 #[cfg(feature = "save")]
 pub mod save;

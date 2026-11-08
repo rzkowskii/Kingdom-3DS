@@ -39,6 +39,9 @@ fn world() -> WorldData {
         auto_build_rate: 0.0,
         scaffold: vec![
             ScaffoldModuleDef {
+                transform: game::data::Affine2::IDENTITY,
+                flip: false,
+                flip_y: false,
                 sprite: None,
                 fill: None,
                 x: 0.0,

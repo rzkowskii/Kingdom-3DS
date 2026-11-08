@@ -4,25 +4,35 @@
        width="100%">
 </p>
 
-*Actual gameplay captured from the Rust reimplementation of Kingdom: New Lands. Not footage from the original PC release.*
+*Gameplay captured from the Rust reimplementation of Kingdom: New Lands.*
 
 # Kingdom: New Lands for Nintendo 3DS
 
 An unofficial Rust reimplementation of **Kingdom: New Lands**, with a desktop backend for development and a Nintendo 3DS backend. You must supply your own PC copy of the game and convert its assets locally.
 
+**Isaiah Boland (`isaiahboland-dotcom`) created the original Nintendo 3DS port.** Richard (`rzkowskii`) maintains this fork. The gameplay and rendering work here started from Isaiah’s `main` branch at tag `v1.2.0`, commit `74a3bc6`. [Original 3DS port](https://github.com/isaiahboland-dotcom/3ds-kingdom-newlands-port) · [v1.2.0 source](https://github.com/isaiahboland-dotcom/3ds-kingdom-newlands-port/tree/v1.2.0)
+
 Game files, decompiled C# references, extracted art, music, fonts, and level data are excluded from Git. The MIT license in [LICENSE](LICENSE) applies to this project's code; it does not grant rights to the original game or extracted material. Builds containing converted assets are for your own use and should not be uploaded to this repository or its releases.
 
 This project is not affiliated with or endorsed by Raw Fury or Noio. Kingdom and its assets belong to their respective owners.
 
-## Status
+## What’s in this fork
 
-The project implements the core simulation, island progression, saves, shared screen rendering, desktop audio, and a 3DS backend with controls, SD saves, DSP audio, and stereoscopic rendering. It is a work in progress: mainly issues with lighting especially at night and around torches/campfire and fixing minor bugs and glitches that may appear alongside optimizations to get a smoother experience on the o3ds. See [deviations](docs/deviations.md), [systems](docs/systems.md), and [performance notes](docs/perf.md).
+The port includes island progression, three save slots with shared unlocks, a touch-screen purse and island map, stamina and compass indicators, and a banner editor for the monarch and coat of arms. The 3DS build supports SD saves, DSP audio, and experimental stereoscopic 3D on systems with a 3D slider.
 
-The 3DS backend enables the faster CPU mode where supported. There is currently no user-facing performance tier option. Mod support is not included.
+- **Combat and save recovery.** Defeated Greed release stolen coins and tools, squid captives can be rescued, and archers aim at airborne targets. Unreadable, damaged, or incompatible slots are protected from autosaves. A valid backup can resume a run, and recovery preserves the rejected original when it can be read. [Combat and save recovery](docs/p1-fidelity.md)
+- **Animation and camera.** The converter preserves prefab transforms and authored animation curves and events. Portal opening, closing, and destruction keep their animation phase through save and resume. Camera lead follows the original timing, with target transitions for the crown, boat, and teleporter. [Asset and animation notes](docs/p2-assets-animation.md) · [Portal and camera notes](docs/p2-remaining-fidelity.md)
+- **Siege and flying enemies.** Catapult chassis and wheels recoil under the shot impulse, and boulders launch from the moving arm. Squids scan for citizens, fly around obstacles, carry captives, and retreat. Bosses can pick up a lodged catapult boulder and throw it back. Boulder impacts produce particles and can shake the camera. [Catapult physics](docs/p3-catapult-physics.md) · [Squid flight](docs/p4-squid-flight-retreat.md) · [Boss throwback](docs/p5-boss-throwback.md) · [Boulder impacts](docs/p6-boulder-impact.md)
+- **Lighting, clouds, and water.** Boss waves can trigger a red moon that fades at dawn. Wind moves the stratus and cumulus layers, and a cloud depth pass shades cumulus rims. Clouds and reflection-only scenery appear in the water, with independent reflection captures for each eye in stereo. [Red moon](docs/p7-red-moon.md) · [Cloud rendering](docs/p8-cloud-rendering.md) · [Cloud shadows](docs/p9-cloud-shadows.md) · [Reflections](docs/p2-remaining-fidelity.md#reflections-audio-and-diagnostics-f08f10-f12)
+- **Audio and diagnostics.** Coin impacts play from the point of contact. Streamed stereo audio validates both channels before playback and recovers from read failures. On 3DS, render toggles are available only while diagnostics are open. [Audio and diagnostics](docs/p2-remaining-fidelity.md#reflections-audio-and-diagnostics-f08f10-f12)
 
-Experimental Stereoscopic 3D
+The current code has passed desktop regression tests and 3DS release packaging. Azahar checks covered gameplay, save loading, and cloud and reflection rendering. Physical 3DS rendering, DSP audio, and performance for these changes still need verification. The 3DS backend requests faster CPU mode where supported. Earlier Old 3DS testing reported stutter during busy coin payouts and construction. [Latest validation](docs/p9-cloud-shadows.md#evidence-and-validation) · [Performance notes](docs/perf.md)
 
-O3ds is supported although there can be some stuttering encountered when multiple farmers are giving you a lot of coins, and when many builders are at work. I am working on further optimizations with the help of AI
+### Upgrading an existing build
+
+This fork currently uses asset format **v8** and save format **v12**. Rerun setup to regenerate the assets and rebuild the 3DS RomFS. The same local AssetRipper export can be reused. World data and sprite sheets must come from the same conversion.
+
+Saves refer to the exact `world.bin` they were made with. If conversion changes the world fingerprint, the game preserves the old slot and marks it incompatible. Keep your previous build, converted assets, and a copy of your saves to continue an older run. The cloud-shadow update leaves the previous v8 world data unchanged. [Save recovery details](docs/p1-fidelity.md#save-compatibility-and-recovery) · [Current asset compatibility](docs/p9-cloud-shadows.md)
 
 ## Installation
 
@@ -33,8 +43,8 @@ There are two ways to build the game: the **automated install** (`build.sh`) ins
 Written for Debian/Ubuntu, Fedora, and Arch based distros (including Mint, Pop!_OS, Manjaro, EndeavourOS, and CachyOS). It has only been tested on Arch based distros so far; **Debian and Fedora remain untested**, in particular the automatic devkitPro install (Fedora has no official devkitPro packages, so that route is a best effort). If a step fails there, set `INSTALL_DEPS=no` in `.env`, install the dependencies by hand as described under [Manual install](#manual-install), and run `./build.sh` again; reports are welcome. You need your own PC copy of Kingdom: New Lands; the Steam **Linux** build is what the port is developed against.
 
 ```sh
-git clone https://github.com/isaiahboland-dotcom/3ds-kingdom-newlands-port.git
-cd 3ds-kingdom-newlands-port
+git clone https://github.com/rzkowskii/Kingdom-3DS.git
+cd Kingdom-3DS
 cp .example.env .env    # optional: edit to change the defaults
 ./build.sh
 ```
@@ -92,7 +102,7 @@ tools/setup.sh --help
 
 Extraction does not require decompiling the game scripts yourself. The optional `--decomp` flag requires `ilspycmd` and writes local development references into ignored `reference/decomp/`.
 
-The desktop backend reads `assets/` by default; set `KINGDOM_ASSETS` to override it. Saves use `KINGDOM_SAVES`, then `$XDG_DATA_HOME/kingdom-3ds`, then `~/.local/share/kingdom-3ds` (or `saves/` if no home directory is available). Saves are tied to the converted `world.bin`; converting a different game build can make existing saves incompatible.
+The desktop backend reads `assets/` by default. Set `KINGDOM_ASSETS` to override it. Saves use `KINGDOM_SAVES`, then `$XDG_DATA_HOME/kingdom-3ds`, then `~/.local/share/kingdom-3ds` (or `saves/` if no home directory is available).
 
 #### Building for 3DS
 
@@ -159,14 +169,14 @@ The converter generates sprite atlases, animation metadata, font glyphs, audio, 
 | Choose an island after a run | Left/Right, Enter | Touch, or left/right and A |
 | Save | F5 or pause menu | Pause menu |
 
-At a payable, tap to drop a coin or hold to pay. The bottom screen shows the purse, day/night timer, stamina, compass, save menu, and island selection. The 3D slider controls depth on the top screen.
+At a payable, tap to drop a coin or hold to pay. The bottom screen shows the purse, day/night timer, stamina, compass, save menu, and island selection. Open **BANNER** in the pause menu to choose a king or queen and edit the coat of arms. The 3D slider controls depth on the top screen.
 
-Desktop development shortcuts include F1 for diagnostics, 1–4 for simulation speed, and I for god mode. These are development features.
+For development, use F1 on desktop or SELECT on 3DS to toggle diagnostics. Desktop shortcuts also include 1–4 for simulation speed and I for god mode. On 3DS, SELECT + R + Y toggles god mode.
 
 ## Repository and checks
 
 - `crates/game`: simulation, progression, and save data.
-- `crates/platform`: platform traits.
+- `crates/platform`: platform traits, save-file handling, and diagnostic controls.
 - `crates/scene`: shared rendering, UI, audio mixing, and session state.
 - `crates/desktop`: macroquad desktop backend.
 - `crates/n3ds`: separately built 3DS backend.

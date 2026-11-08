@@ -36,6 +36,7 @@ fn class_name(id: u32) -> String {
         222 => "CanvasRenderer",
         223 => "Canvas",
         224 => "RectTransform",
+        233 => "HingeJoint2D",
         _ => return format!("Class{id}"),
     }
     .to_owned()
@@ -276,6 +277,7 @@ pub fn export_file(path: &Path, r: &Resolver) -> Result<Value, String> {
             .collect();
         json!({
             "id": go_id,
+            "transform_id": tf.map(|t| t.id),
             "name": go.body.get("m_Name").cloned().unwrap_or(Value::Null),
             "active": go.body.get("m_IsActive").and_then(Value::as_i64) != Some(0),
             "tag": go.body.get("m_TagString").cloned().unwrap_or(Value::Null),
@@ -377,6 +379,7 @@ GameObject:
   m_Component:
   - component: {fileID: 11}
   - component: {fileID: 12}
+  - component: {fileID: 13}
   m_Name: Root
   m_TagString: Untagged
   m_IsActive: 1
@@ -395,6 +398,12 @@ SpriteRenderer:
   m_GameObject: {fileID: 10}
   m_Enabled: 1
   m_Sprite: {fileID: 21300000, guid: abc, type: 2}
+--- !u!233 &13
+HingeJoint2D:
+  m_GameObject: {fileID: 10}
+  m_ConnectedRigidBody: {fileID: 88}
+  m_ConnectedAnchor: {x: 0.421875, y: 0.171875}
+  m_UseMotor: 0
 --- !u!1 &20
 GameObject:
   m_Component:
@@ -421,14 +430,25 @@ Transform:
         let v = export_file(&file, &r).unwrap();
         let root = &v["roots"][0];
         assert_eq!(root["name"], "Root");
+        assert_eq!(root["transform_id"], 11);
         assert_eq!(root["pos"], json!([1.5, 2.0, 0.0]));
         assert_eq!(root["scale"][0], -1.0);
         assert_eq!(root["components"][0]["type"], "SpriteRenderer");
+        assert_eq!(root["components"][1]["type"], "HingeJoint2D");
+        assert_eq!(
+            root["components"][1]["fields"]["m_ConnectedRigidBody"]["local"],
+            88
+        );
+        assert_eq!(
+            root["components"][1]["fields"]["m_ConnectedAnchor"]["x"],
+            0.421875
+        );
         assert_eq!(
             root["components"][0]["fields"]["m_Sprite"]["asset"],
             "Sprite/coin.asset"
         );
         assert_eq!(root["children"][0]["name"], "Child");
+        assert_eq!(root["children"][0]["transform_id"], 21);
         assert_eq!(root["children"][0]["active"], false);
         std::fs::remove_dir_all(dir).ok();
     }

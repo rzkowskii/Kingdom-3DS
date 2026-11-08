@@ -10,7 +10,7 @@ use game::rng::Rng;
 
 use crate::heraldry;
 use crate::render::{Color, Draw, Rect, Renderer};
-use crate::session::Session;
+use crate::session::{Session, SlotState};
 use crate::sheet::Sheet;
 use crate::text;
 use crate::top;
@@ -36,6 +36,8 @@ pub const ACTION: Rect = Rect::new(240.0, 194.0, 62.0, 18.0);
 const SLOT_ROW: Rect = Rect::new(10.0, 46.0, 300.0, 42.0);
 const SLOT_GAP: f32 = 48.0;
 pub const RESUME: Rect = Rect::new(110.0, 196.0, 100.0, 28.0);
+const REPLACE: Rect = Rect::new(166.0, 152.0, 130.0, 28.0);
+const CANCEL: Rect = Rect::new(24.0, 152.0, 130.0, 28.0);
 /// Opens the banner editor.
 const BANNER: Rect = Rect::new(10.0, 196.0, 92.0, 28.0);
 
@@ -241,6 +243,14 @@ pub fn tap(s: &mut Session, sheet: &Sheet, p: (f32, f32)) -> Tap {
         }
         return Tap::Nothing;
     }
+    if s.pending_new_slot.is_some() {
+        if REPLACE.contains(p) {
+            s.confirm_new_game();
+        } else if CANCEL.contains(p) || PAUSE.contains(p) {
+            s.cancel_new_game();
+        }
+        return Tap::Nothing;
+    }
     if PAUSE.contains(p) {
         return Tap::Pause;
     }
@@ -255,7 +265,11 @@ pub fn tap(s: &mut Session, sheet: &Sheet, p: (f32, f32)) -> Tap {
         }
         for i in 0..game::save::SLOTS {
             if slot_save(i).contains(p) {
-                s.save_to(i);
+                if matches!(s.slots[i], SlotState::Failed(_)) {
+                    s.request_new_game(i);
+                } else {
+                    s.save_to(i);
+                }
             } else if slot_load(i).contains(p) {
                 s.load_from(i);
             }
@@ -277,7 +291,37 @@ pub fn draw(s: &Session, sheet: &Sheet, r: &mut impl Renderer) {
         draw_map(s, sheet, r);
         return;
     }
-    if let Some(ed) = s.editor {
+    if let Some(slot) = s.pending_new_slot {
+        text::draw(
+            r,
+            sheet,
+            &format!("REPLACE SLOT {}?", slot + 1),
+            36.0,
+            60.0,
+            24.0,
+            Color::WHITE,
+        );
+        text::draw(
+            r,
+            sheet,
+            "START A NEW GAME IN THIS SLOT.",
+            24.0,
+            96.0,
+            14.0,
+            Color::WHITE,
+        );
+        text::draw(
+            r,
+            sheet,
+            "THE EXISTING SAVE WILL BE REPLACED.",
+            24.0,
+            116.0,
+            14.0,
+            Color::WHITE,
+        );
+        button(r, sheet, CANCEL, "CANCEL", Color::WHITE);
+        button(r, sheet, REPLACE, "REPLACE", GOLD);
+    } else if let Some(ed) = s.editor {
         draw_editor(s, ed, sheet, r);
     } else if s.paused {
         draw_pause(s, sheet, r);
@@ -298,8 +342,9 @@ pub fn draw(s: &Session, sheet: &Sheet, r: &mut impl Renderer) {
             Color::new(1.0, 0.85, 0.3, 1.0),
         );
     }
-    let lines = s.warning.lines().count() as f32;
-    for (i, l) in s.warning.lines().enumerate() {
+    let warnings = [s.warning.as_str(), s.save_message.as_str()];
+    let lines = warnings.iter().flat_map(|w| w.lines()).count() as f32;
+    for (i, l) in warnings.iter().flat_map(|w| w.lines()).enumerate() {
         let (w, _) = text::measure(sheet, l, 12.0);
         let y = H - 11.0 * (lines - i as f32);
         text::draw(
@@ -375,17 +420,27 @@ fn draw_pause(s: &Session, sheet: &Sheet, r: &mut impl Renderer) {
             color,
         );
         let info = match &s.slots[i] {
-            Some(info) => format!(
+            SlotState::Saved(info) | SlotState::Recovered(info) => format!(
                 "{} - DAY {} - {} COINS",
                 info.island.to_uppercase(),
                 info.day,
                 info.coins
             ),
-            None => "EMPTY".to_owned(),
+            SlotState::Empty => "EMPTY".to_owned(),
+            SlotState::Failed(problem) => problem.label().to_owned(),
         };
         text::draw(r, sheet, &info, row.x + 8.0, row.y + 34.0, 14.0, dim);
-        button(r, sheet, slot_save(i), "SAVE", Color::WHITE);
-        let load = if s.slots[i].is_some() { "LOAD" } else { "NEW" };
+        let save = if matches!(s.slots[i], SlotState::Failed(_)) {
+            "NEW"
+        } else {
+            "SAVE"
+        };
+        button(r, sheet, slot_save(i), save, Color::WHITE);
+        let load = match s.slots[i] {
+            SlotState::Empty => "NEW",
+            SlotState::Failed(_) => "RETRY",
+            _ => "LOAD",
+        };
         button(r, sheet, slot_load(i), load, Color::WHITE);
     }
     button(r, sheet, BANNER, "BANNER", Color::WHITE);

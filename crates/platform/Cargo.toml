@@ -7,3 +7,6 @@ license.workspace = true
 description = "Platform traits: Renderer, Input, Audio, Storage, Clock, HardwareInfo"
 
 [dependencies]
+
+[features]
+std = []

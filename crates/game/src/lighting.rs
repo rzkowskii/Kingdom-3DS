@@ -20,11 +20,16 @@ pub mod color {
     pub const SUN_GLOW: usize = 9;
     pub const MOON_TINT: usize = 10;
     pub const MOON_GLOW: usize = 11;
+    pub const CLOUD_BASE: usize = 12;
+    pub const CLOUD_HIGHLIGHT: usize = 13;
+    pub const CLOUD_STRATUS: usize = 14;
     pub const FOG: usize = 15;
 }
 
 /// Indices into [`Light::floats`] (orig: `BlenderState.FloatField`).
 pub mod float {
+    pub const CLOUD_DENSITY: usize = 0;
+    pub const CLOUD_STRATUS_DENSITY: usize = 1;
     pub const FOG_DENSITY: usize = 2;
     pub const STARS: usize = 5;
     pub const RAIN: usize = 6;
@@ -187,6 +192,9 @@ impl Fader {
 pub struct Blender {
     pub state: Light,
     stack: Vec<Fader>,
+    /// EnemyManager's transient fader reference. Reload looks it up by preset.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    red_moon_bound: bool,
 }
 
 impl Blender {
@@ -207,7 +215,41 @@ impl Blender {
             b.add(world, p, 0.0);
         }
         b.update(world, 0.0);
+        b.rebind_red_moon(world);
         b
+    }
+
+    pub(crate) fn rebind_red_moon(&mut self, world: &WorldData) {
+        self.red_moon_bound = world
+            .red_moon
+            .is_some_and(|preset| self.stack.iter().any(|fader| fader.preset == preset));
+    }
+
+    /// orig: EnemyManager.SpawnWave. Restart an active fade from its current weight.
+    pub(crate) fn start_red_moon(&mut self, world: &WorldData) {
+        let Some(preset) = world.red_moon else { return };
+        if self.red_moon_bound {
+            if let Some(fader) = self.stack.iter_mut().rfind(|fader| fader.preset == preset) {
+                fader.tween_to(1.0, 10.0, 0.0, false);
+            }
+        } else {
+            self.add(world, preset, 10.0);
+            self.red_moon_bound = true;
+        }
+    }
+
+    /// orig: EnemyManager.ClearRedMoon. Release the reference immediately,
+    /// while the fader stays on the stack for its ten-second exit.
+    pub(crate) fn clear_red_moon(&mut self, world: &WorldData) {
+        if core::mem::take(&mut self.red_moon_bound) {
+            if let Some(fader) = self
+                .stack
+                .iter_mut()
+                .rfind(|fader| Some(fader.preset) == world.red_moon)
+            {
+                fader.tween_to(0.0, 10.0, 0.0, true);
+            }
+        }
     }
 
     /// Fades `preset` in over `duration` seconds. A preset with a category
@@ -340,5 +382,62 @@ mod tests {
         assert!((b.state.colors[color::AMBIENT][0] - 1.0).abs() < 1e-3);
         // The old preset is gone 3 s after the new one finished fading in.
         assert_eq!(b.stack.len(), 1);
+    }
+
+    #[test]
+    fn red_moon_retargets_one_fader_above_weather_and_releases_it_at_dawn() {
+        let mut night = preset("night", 0.2);
+        night.enabled |= 1 << color::MOON_TINT | 1 << (LIGHT_COLORS.len() + float::STARS);
+        night.colors[color::MOON_TINT] = [1.0; 4];
+        night.floats[float::STARS] = 1.0;
+        let mut red = preset("Red Moon", 0.0);
+        red.category = 0;
+        red.enabled = 0x0040_6c00;
+        red.colors[color::MOON_TINT] = [0.6, 0.2, 0.1, 1.0];
+        let mut next = night.clone();
+        next.colors[color::AMBIENT] = [0.7, 0.8, 0.9, 1.0];
+        next.floats[float::STARS] = 0.8;
+        let world = WorldData {
+            lights: vec![night, red, next],
+            red_moon: Some(1),
+            director: DirectorDef {
+                initial_lights: vec![0],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut b = Blender::new(&world);
+        b.start_red_moon(&world);
+        b.update(&world, 4.0);
+        assert_eq!(b.presets().collect::<Vec<_>>(), vec![(0, 1.0), (1, 0.4)]);
+        b.start_red_moon(&world);
+        b.add(&world, 2, 2.0);
+        b.update(&world, 5.0);
+        assert_eq!(
+            b.presets().map(|(id, _)| id).collect::<Vec<_>>(),
+            vec![2, 1]
+        );
+        assert!((b.presets().last().unwrap().1 - 0.7).abs() < 1e-6);
+        assert_eq!(
+            b.state.colors[color::AMBIENT],
+            world.lights[2].colors[color::AMBIENT]
+        );
+        assert!((b.state.colors[color::MOON_TINT][1] - 0.44).abs() < 1e-6);
+        assert!((b.state.floats[float::STARS] - 0.24).abs() < 1e-6);
+
+        b.clear_red_moon(&world);
+        b.update(&world, 5.0);
+        let fading = b.presets().last().unwrap();
+        assert_eq!(fading.0, 1);
+        assert!((fading.1 - 0.35).abs() < 1e-6);
+        // Another accepted wave during the fade appends a new fader in the
+        // live scene, because dawn has released the old reference.
+        b.start_red_moon(&world);
+        assert_eq!(
+            b.presets().collect::<Vec<_>>(),
+            vec![(2, 1.0), fading, (1, 0.0)]
+        );
+        b.update(&world, 5.0);
+        assert_eq!(b.presets().collect::<Vec<_>>(), vec![(2, 1.0), (1, 0.5)]);
     }
 }

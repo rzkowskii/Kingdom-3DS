@@ -23,7 +23,7 @@ fn tick(bag: &mut Bag, def: &game::data::BagDef, n: &mut u32, rng: &mut Rng) -> 
 
 fn main() {
     let world: WorldData =
-        postcard::from_bytes(&std::fs::read("assets/world.bin").unwrap()).unwrap();
+        game::assetfile::decode_world(&std::fs::read("assets/world.bin").unwrap()).unwrap();
     let def = &world.bag;
     for &ask in &[5u32, 20, 60, 150, 300] {
         let mut n = ask;
@@ -50,7 +50,11 @@ fn main() {
             spilled += tick(&mut bag, def, &mut n, &mut rng);
             let now: Vec<_> = bag.coins.iter().map(|c| (px(c), c.angle)).collect();
             let m = now.iter().zip(&prev).filter(|(a, b)| a.0 != b.0).count();
-            let t = now.iter().zip(&prev).filter(|(a, b)| (a.1 - b.1).abs() > 0.5).count();
+            let t = now
+                .iter()
+                .zip(&prev)
+                .filter(|(a, b)| (a.1 - b.1).abs() > 0.5)
+                .count();
             moved += m;
             turned += t;
             frames_moving += (m + t > 0) as u32;

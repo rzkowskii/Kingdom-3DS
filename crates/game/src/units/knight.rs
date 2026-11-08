@@ -415,10 +415,10 @@ fn slash(u: &mut Unit, dt: f32, ctx: &Ctx, events: &mut impl FnMut(UnitEvent)) {
         let (a, b) = (x + HIT_BOX.0 * facing, x + HIT_BOX.1 * facing);
         let (lo, hi) = (a.min(b), a.max(b));
         for e in ctx.enemies {
-            if e.1 + TROLL_HALF_WIDTH > lo && e.1 - TROLL_HALF_WIDTH < hi && !hits.contains(&e.0) {
-                hits.push(e.0);
+            if e.x + TROLL_HALF_WIDTH > lo && e.x - TROLL_HALF_WIDTH < hi && !hits.contains(&e.id) {
+                hits.push(e.id);
                 events(UnitEvent::Strike {
-                    troll: e.0,
+                    troll: e.id,
                     damage: ATTACK_DAMAGE,
                     from_x: x,
                 });
@@ -452,7 +452,7 @@ fn slash(u: &mut Unit, dt: f32, ctx: &Ctx, events: &mut impl FnMut(UnitEvent)) {
     let closest = ctx
         .enemies
         .iter()
-        .map(|e| e.1)
+        .map(|e| e.x)
         .chain(ctx.portals.iter().filter(|p| p.alive).map(|p| p.x))
         .filter(|&ex| in_scan(ex))
         .min_by(|a, b| (a - x).abs().total_cmp(&(b - x).abs()));

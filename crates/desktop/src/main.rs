@@ -97,7 +97,7 @@ async fn main() {
         .map_err(|e| e.to_string())
         .and_then(|b| {
             world_id = save::fingerprint(&b);
-            postcard::from_bytes(&b).map_err(|e| e.to_string())
+            game::assetfile::decode_world(&b).map_err(|e| e.to_string())
         }) {
         Ok(w) => w,
         Err(e) => {
@@ -105,7 +105,7 @@ async fn main() {
             std::process::exit(1);
         }
     };
-    let mut assets = match Assets::load(std::path::Path::new(&dir), &world.sprites).await {
+    let mut assets = match Assets::load(std::path::Path::new(&dir), &world).await {
         Ok(a) => a,
         Err(e) => {
             eprintln!("could not load assets from {dir}/: {e}");
@@ -139,30 +139,18 @@ async fn main() {
     } else {
         storage
             .as_ref()
-            .and_then(|s| s.read(save::UNLOCKS_SLOT))
-            .and_then(|b| save::load_progress(&b).ok())
+            .map(|s| Session::saved_progress(s))
             .unwrap_or_default()
     };
     let fresh = std::env::args().any(|a| a == "--new" || a == "--island");
     let slot = storage.as_ref().map_or(0, |s| Session::last_slot(s));
     // --load reads the saved game even in screenshot runs (still never writing).
-    let saved = (!fresh)
-        .then(|| {
-            storage.as_ref().map_or_else(
-                || {
-                    std::env::args()
-                        .any(|a| a == "--load")
-                        .then(storage::Files::new)
-                        .and_then(|s| s.read(&save::game_slot(slot)))
-                },
-                |s| s.read(&save::game_slot(slot)),
-            )
-        })
-        .flatten()
-        .and_then(|b| match save::load_game(&b, world_id, &world) {
-            Ok(g) => Some(g),
+    let saved = (storage.is_none() && !fresh && std::env::args().any(|a| a == "--load"))
+        .then(|| Session::saved_game(&storage::Files::new(), slot, world_id, &world))
+        .and_then(|r| match r {
+            Ok(game) => game,
             Err(e) => {
-                eprintln!("ignoring the saved game ({e:?})");
+                eprintln!("save preserved ({e:?})");
                 None
             }
         });
@@ -174,6 +162,13 @@ async fn main() {
     app.storage = storage.map(|s| Box::new(s) as Box<dyn Storage>);
     app.world_id = world_id;
     app.slot = slot;
+    if app.storage.is_some() {
+        if fresh {
+            app.authorize_new_game();
+        } else {
+            app.load_from(slot);
+        }
+    }
     if std::env::args().any(|a| a == "--paused") {
         app.set_paused(true);
     }
@@ -370,6 +365,7 @@ async fn main() {
         top::draw(&app, &sheet, &mut assets);
         set_camera(&camera_for(&previous_rt, TOP_W, TOP_H));
         draw_texture(&top_rt.texture, 0.0, 0.0, WHITE);
+        top::draw_reflection_extras(&app, &sheet, &mut assets);
         assets.previous = Some(previous_rt.texture.clone());
         set_camera(&camera_for(&bot_rt, BOT_W, BOT_H));
         touch::draw(&app, &sheet, &mut assets);

@@ -9,6 +9,8 @@ use game::lighting::{celestial_position, celestial_up, color, float, Light};
 use game::monarch::Action;
 use game::units::{Anim, ShieldStatus};
 
+use crate::cloud_shadow;
+use crate::clouds::{CloudKind, CloudSample};
 use crate::heraldry;
 use crate::render::{Color, Draw, Rect, Renderer};
 use crate::session::Session;
@@ -21,7 +23,7 @@ pub const PPU: f32 = 32.0;
 
 pub use game::build::WALK_Y;
 /// orig: Main Camera y. The view is centered here.
-pub const CAMERA_Y: f32 = 1.875;
+pub const CAMERA_Y: f32 = crate::camera::CAMERA_Y;
 /// Depth of the monarch and coins in the game layer. orig: Player prefab z;
 /// `Droppable.Drop` puts coins 0.01 in front of the dropper.
 const MONARCH_Z: f32 = 1.0;
@@ -103,7 +105,10 @@ impl<R: Renderer> Ctx<'_, R> {
         if g.w as f32 > POINT_LIT_MAX_W {
             return tint;
         }
-        let centre = (at.0 - g.px + g.w as f32 / 2.0, at.1 - g.py + g.h as f32 / 2.0);
+        let centre = (
+            at.0 - g.px + g.w as f32 / 2.0,
+            at.1 - g.py + g.h as f32 / 2.0,
+        );
         let mut add = [0.0f32; 3];
         for l in &self.lights {
             let f = ((centre.0 - l.at.0).powi(2) + (centre.1 - l.at.1).powi(2)).sqrt() / l.range;
@@ -193,12 +198,11 @@ const POINT_LIGHT_K: f32 = 0.6;
 /// The ground's rough colour, for the light it throws back.
 const GROUND_ALBEDO: [f32; 3] = [0.22, 0.14, 0.09];
 
-
 /// Screen pixel of a world point in a layer with parallax `ratio`.
 pub fn layer_to_screen(s: &Session, x: f32, y: f32, ratio: f32) -> (f32, f32) {
     (
-        ((x - ratio * s.camera_x) * PPU + W / 2.0).round(),
-        (H / 2.0 - (y - CAMERA_Y) * PPU).round(),
+        ((x - ratio * (s.camera_x + s.camera_shake_offset()[0])) * PPU + W / 2.0).round(),
+        world_row(s, y),
     )
 }
 
@@ -210,6 +214,10 @@ pub fn world_to_screen(s: &Session, x: f32, y: f32) -> (f32, f32) {
 /// Screen row of a world height.
 pub fn screen_y(y: f32) -> f32 {
     (H / 2.0 - (y - CAMERA_Y) * PPU).round()
+}
+
+fn world_row(s: &Session, y: f32) -> f32 {
+    (H / 2.0 - (y - CAMERA_Y - s.camera_shake_offset()[1]) * PPU).round()
 }
 
 fn offset(p: (f32, f32), dx: f32, dy: f32) -> (f32, f32) {
@@ -226,8 +234,15 @@ fn stereo_depth(z: f32) -> f32 {
 }
 
 /// Full-width vertical gradient between world heights. orig: `HorizontalGradient`.
-fn gradient(r: &mut impl Renderer, bottom_y: f32, top_y: f32, bottom: Color, top: Color) {
-    let (yb, yt) = (screen_y(bottom_y), screen_y(top_y));
+fn gradient(
+    s: &Session,
+    r: &mut impl Renderer,
+    bottom_y: f32,
+    top_y: f32,
+    bottom: Color,
+    top: Color,
+) {
+    let (yb, yt) = (world_row(s, bottom_y), world_row(s, top_y));
     r.gradient(Rect::new(0.0, yt, W, yb - yt), top, bottom);
 }
 
@@ -256,6 +271,7 @@ pub enum DrawItem {
     Glow(usize, usize),
     /// The night star field (Heaven layer, behind the sun and moon).
     Stars,
+    Cloud(usize),
     /// A grass patch.
     Grass(usize),
     FreeSteed(usize),
@@ -266,6 +282,7 @@ pub enum DrawItem {
     Chest(usize),
     Banker,
     Boulder(usize),
+    BoulderParticle(usize),
     Dog,
     Animal(usize),
     /// A boat part lying at the wharf (or flying into place).
@@ -273,7 +290,11 @@ pub enum DrawItem {
     /// Someone standing on the boat's deck.
     Deckhand(usize),
     /// Fire `f` of object `o` (of the scenery when `scenery`).
-    Fire { o: usize, f: usize, scenery: bool },
+    Fire {
+        o: usize,
+        f: usize,
+        scenery: bool,
+    },
     /// The monarch's torch.
     Torch,
 }
@@ -284,6 +305,19 @@ fn layer_z(world: &game::data::WorldData) -> f32 {
 
 /// Painter's order: Unity sorts by sorting layer, then order, then distance.
 pub fn draw_list(s: &Session) -> Vec<((i16, i16, f32), DrawItem)> {
+    draw_list_with_effects(s, &[], &[])
+}
+
+struct CloudDraw {
+    sample: CloudSample,
+    shadow: Option<[u16; 2]>,
+}
+
+fn draw_list_with_effects(
+    s: &Session,
+    particles: &[crate::boulder_fx::BoulderParticleSample],
+    clouds: &[CloudDraw],
+) -> Vec<((i16, i16, f32), DrawItem)> {
     let world = &s.world;
     let g = &s.game;
     let level = &g.level;
@@ -320,7 +354,10 @@ pub fn draw_list(s: &Session) -> Vec<((i16, i16, f32), DrawItem)> {
         }
         for (pi, part) in proto.parts.iter().enumerate() {
             // Under construction only the Scaffolding subtree shows, once built only the rest.
-            if !o.parts[pi].visible || part.scaffold != building {
+            if part.reflection_only
+                || (!o.parts[pi].visible && part.sprite.is_some())
+                || part.scaffold != building
+            {
                 continue;
             }
             let z = layer.z + o.z + part.z;
@@ -337,13 +374,20 @@ pub fn draw_list(s: &Session) -> Vec<((i16, i16, f32), DrawItem)> {
         }
         push_fires(&mut items, s, o, oi, true);
         for (pi, part) in world.protos[o.proto as usize].parts.iter().enumerate() {
-            if !o.parts[pi].visible || part.scaffold {
+            if part.reflection_only
+                || (!o.parts[pi].visible && part.sprite.is_some())
+                || part.scaffold
+            {
                 continue;
             }
             let mut z = layer.z + o.z + part.z;
             // The ghost waits where the forest grows, so it's drawn just
             // behind the monarch rather than lost behind a trunk.
-            if g.tutorial.ghost.as_ref().is_some_and(|gh| gh.object == o.id) {
+            if g.tutorial
+                .ghost
+                .as_ref()
+                .is_some_and(|gh| gh.object == o.id)
+            {
                 z = MONARCH_Z - 0.02;
             }
             items.push((
@@ -404,8 +448,17 @@ pub fn draw_list(s: &Session) -> Vec<((i16, i16, f32), DrawItem)> {
             items.push(((0, 0, -0.95), DrawItem::Dog));
         }
     }
-    for i in 0..g.siege.boulders.len() {
-        items.push(((0, 0, -0.7), DrawItem::Boulder(i)));
+    for (i, boulder) in g.siege.boulders.iter().enumerate() {
+        if boulder.runtime.held_by.is_none() {
+            items.push(((0, 0, -0.7), DrawItem::Boulder(i)));
+        }
+    }
+    for (i, particle) in particles.iter().enumerate() {
+        // The projector stores particle z relative to its boulder root.
+        items.push(((0, 0, -0.7 - particle.z), DrawItem::BoulderParticle(i)));
+    }
+    for (i, cloud) in clouds.iter().enumerate() {
+        items.push(((0, 0, -cloud.sample.position[2]), DrawItem::Cloud(i)));
     }
     for i in 0..g.greed.bolts.len() {
         items.push(((0, 0, -0.7), DrawItem::Bolt(i)));
@@ -489,7 +542,10 @@ pub fn draw_list(s: &Session) -> Vec<((i16, i16, f32), DrawItem)> {
         .map(|(i, &(k, _))| (u128::from(sort_key(k)) << 32) | i as u128)
         .collect();
     order.sort_unstable();
-    order.into_iter().map(|o| items[o as u32 as usize]).collect()
+    order
+        .into_iter()
+        .map(|o| items[o as u32 as usize])
+        .collect()
 }
 
 /// `(sort layer, order, z)` as one integer in the same order: the sort
@@ -500,6 +556,73 @@ fn sort_key((layer, order, z): (i16, i16, f32)) -> u64 {
     let b = z.to_bits();
     let z = if b >> 31 == 1 { !b } else { b | 0x8000_0000 };
     (flip(layer) << 48) | (flip(order) << 32) | u64::from(z)
+}
+
+/// Extra geometry Unity draws into its reflection buffer after copying the
+/// visible scene. It must never enter the ordinary top-screen draw list.
+pub fn reflection_list(s: &Session) -> Vec<((i16, i16, f32), DrawItem)> {
+    let mut items = Vec::new();
+    let view = W / PPU / 2.0 + 12.0;
+    for (scenery, objects) in [
+        (false, &s.game.level.objects),
+        (true, &s.game.level.scenery),
+    ] {
+        for (oi, o) in objects.iter().enumerate() {
+            let layer = s.world.layer(o.layer);
+            if (o.x - layer.ratio * s.camera_x).abs() > view {
+                continue;
+            }
+            let building = !scenery && under_construction(&s.world, o);
+            for (pi, part) in s.world.protos[o.proto as usize].parts.iter().enumerate() {
+                if !part.reflection_only
+                    || part.scaffold != building
+                    || (!o.parts[pi].visible && part.sprite.is_some())
+                {
+                    continue;
+                }
+                let key = (part.sort_layer, part.sort_order, -(layer.z + o.z + part.z));
+                items.push((
+                    key,
+                    if scenery {
+                        DrawItem::Scenery(oi, pi)
+                    } else {
+                        DrawItem::Part(oi, pi)
+                    },
+                ));
+            }
+        }
+    }
+    items.sort_by_key(|(key, _)| sort_key(*key));
+    items
+}
+
+/// Draw only layer-29 geometry on a backend's copied reflection target.
+/// Does not clear it, redraw water, or add overlays from the normal screen.
+pub fn draw_reflection_extras<R: Renderer>(s: &Session, sheet: &Sheet, r: &mut R) {
+    let items = reflection_list(s);
+    if items.is_empty() {
+        return;
+    }
+    let lights = draw_list(s)
+        .iter()
+        .filter_map(|(_, item)| fire_item(s, item))
+        .filter_map(|(at, fire, seed)| fire_light(s, at, &fire, seed))
+        .collect();
+    let mut c = Ctx {
+        s,
+        sheet,
+        r,
+        lights,
+    };
+    let game_z = layer_z(&s.world);
+    for (key, item) in items {
+        c.r.depth(stereo_depth(-key.2 - game_z));
+        match item {
+            DrawItem::Part(oi, pi) => draw_part(&mut c, &s.game.level.objects[oi], pi),
+            DrawItem::Scenery(oi, pi) => draw_part(&mut c, &s.game.level.scenery[oi], pi),
+            _ => unreachable!("reflection list only contains sprite parts"),
+        }
+    }
 }
 
 /// Whether fire `f` burns now. orig: `Fire.Start` / `HandleOnDayEnd`:
@@ -516,7 +639,13 @@ fn torch_lit(s: &Session) -> bool {
 }
 
 /// Draw items for an object's burning fires, above its own parts.
-fn push_fires(items: &mut Vec<((i16, i16, f32), DrawItem)>, s: &Session, o: &game::level::Object, oi: usize, scenery: bool) {
+fn push_fires(
+    items: &mut Vec<((i16, i16, f32), DrawItem)>,
+    s: &Session,
+    o: &game::level::Object,
+    oi: usize,
+    scenery: bool,
+) {
     let proto = &s.world.protos[o.proto as usize];
     if proto.fires.is_empty() {
         return;
@@ -546,7 +675,11 @@ fn fire_intensity(s: &Session, fire: &FireDef, seed: u32) -> (f32, f32, f32) {
         h as f32 / (1u32 << 23) as f32 * 2.0 - 1.0
     };
     let flicker = noise(k.floor()) + (noise(k.floor() + 1.0) - noise(k.floor())) * k.fract();
-    (strength, sample_keys(&st.intensity, strength) + flicker * 0.3 * dark, dark)
+    (
+        strength,
+        sample_keys(&st.intensity, strength) + flicker * 0.3 * dark,
+        dark,
+    )
 }
 
 /// A fire's point light. Every fire gets one, as on the PC's high quality
@@ -571,11 +704,20 @@ fn fire_light(s: &Session, at: (f32, f32), fire: &FireDef, seed: u32) -> Option<
 fn fire_item(s: &Session, item: &DrawItem) -> Option<((f32, f32), FireDef, u32)> {
     match *item {
         DrawItem::Fire { o, f, scenery } => {
-            let objs = if scenery { &s.game.level.scenery } else { &s.game.level.objects };
+            let objs = if scenery {
+                &s.game.level.scenery
+            } else {
+                &s.game.level.objects
+            };
             let o = &objs[o];
             let fire = s.world.protos[o.proto as usize].fires[f];
             let dir = if o.flip { -1.0 } else { 1.0 };
-            let at = layer_to_screen(s, o.x + dir * fire.at.0, o.y + fire.at.1, s.world.layer(o.layer).ratio);
+            let at = layer_to_screen(
+                s,
+                o.x + dir * fire.at.0,
+                o.y + fire.at.1,
+                s.world.layer(o.layer).ratio,
+            );
             Some((at, fire, o.id.wrapping_mul(7) + f as u32))
         }
         DrawItem::Torch => {
@@ -595,15 +737,16 @@ fn draw_fire<R: Renderer>(c: &mut Ctx<R>, at: (f32, f32), fire: &FireDef, seed: 
     let s = c.s;
     let st = &s.world.fire;
     // The flame: the prefab nearest in size that has a sprite animation.
-    let flame = st
-        .flames
-        .iter()
-        .filter(|f| f.1.is_some())
-        .min_by(|a, b| {
-            let d = |f: &((f32, f32), Option<u16>)| (f.0 .0 - fire.size.0).powi(2) + (f.0 .1 - fire.size.1).powi(2);
-            d(a).total_cmp(&d(b))
-        });
-    if let Some(name) = flame.and_then(|f| f.1).map(|id| s.world.sprites[id as usize].as_str()) {
+    let flame = st.flames.iter().filter(|f| f.1.is_some()).min_by(|a, b| {
+        let d = |f: &((f32, f32), Option<u16>)| {
+            (f.0 .0 - fire.size.0).powi(2) + (f.0 .1 - fire.size.1).powi(2)
+        };
+        d(a).total_cmp(&d(b))
+    });
+    if let Some(name) = flame
+        .and_then(|f| f.1)
+        .map(|id| s.world.sprites[id as usize].as_str())
+    {
         if let Some(sp) = flame_clip(c, name, s.t + seed as f32 * 0.13) {
             c.r.sprite(sp, at, Draw::tint(WHITE).additive());
         }
@@ -625,7 +768,7 @@ const GROUND_FADE: f32 = 1.0 / 6.0;
 fn draw_ground_light<R: Renderer>(c: &mut Ctx<R>) {
     let s = c.s;
     let top = (world_to_screen(s, 0.0, 0.0).1 - 2.0).round();
-    let bottom = screen_y(s.world.water.top).round();
+    let bottom = world_row(s, s.world.water.top);
     if bottom <= top || c.lights.is_empty() {
         return;
     }
@@ -681,10 +824,17 @@ fn draw_fire_reflection<R: Renderer>(c: &mut Ctx<R>, at: (f32, f32), fire: &Fire
     let tint = Color::new(r * a, g * a, b * a, 1.0);
     // Mirrored from 0.25 units above the water's top, so it starts a few
     // pixels into the water and hangs down.
-    let y = screen_y(w.top) + 0.25 * PPU * w.reflection_scale;
+    let y = world_row(s, w.top) + 0.25 * PPU * w.reflection_scale;
     for i in 0..copies {
         let x = (at.0 + (i as f32 - (copies - 1) as f32 / 2.0) * 8.0).round();
-        c.r.sprite(sp, (x, y), Draw::tint(tint).angle(core::f32::consts::PI).flip(i % 2 == 1).additive());
+        c.r.sprite(
+            sp,
+            (x, y),
+            Draw::tint(tint)
+                .angle(core::f32::consts::PI)
+                .flip(i % 2 == 1)
+                .additive(),
+        );
     }
 }
 
@@ -694,7 +844,9 @@ const REFLECTED_LIGHT: [f32; 3] = [0.797, 0.597, 0.24];
 /// The animation for flame sprite `name` (`fire_small_burn_4` →
 /// `fire_small_burn`, `fire_mid_burn_7` → `fire_mid`).
 fn flame_clip<R: Renderer>(c: &Ctx<R>, name: &str, t: f32) -> Option<u32> {
-    let mut n = name.trim_end_matches(|ch: char| ch.is_ascii_digit()).trim_end_matches('_');
+    let mut n = name
+        .trim_end_matches(|ch: char| ch.is_ascii_digit())
+        .trim_end_matches('_');
     loop {
         if let Some(sp) = c.frame(n, t) {
             return Some(sp);
@@ -876,15 +1028,175 @@ fn draw_free_steed<R: Renderer>(c: &mut Ctx<R>, i: usize) {
     c.sprite_lit(sprite, world_to_screen(s, o.x, 0.0), d);
 }
 
+/// The simulation chooses action state and owns its clock; the renderer only
+/// samples the authored clip. Decorative loops use the saved tick clock.
+fn object_animation<'a>(
+    s: &'a Session,
+    o: &game::level::Object,
+    controller: &str,
+) -> Option<(&'a str, f32)> {
+    let library = &s.world.animations;
+    let key = controller
+        .rsplit('/')
+        .next()
+        .unwrap_or(controller)
+        .split('.')
+        .next()
+        .unwrap_or(controller);
+    let (state, elapsed) = match key {
+        "catapult" => match o.mode {
+            game::siege::mode::FIRING => (
+                library.state(controller, "Fire")?,
+                s.game
+                    .siege
+                    .catapults
+                    .iter()
+                    .find(|c| c.object == o.id)?
+                    .fire_t,
+            ),
+            game::siege::mode::READY => (library.state(controller, "Ready")?, 0.0),
+            _ => return None, // disabled animator; builders rotate the arm
+        },
+        "portal" => {
+            let (name, time) = s
+                .game
+                .greed
+                .portal_animation(o.id)
+                .unwrap_or(("Close", 0.0));
+            (library.state(controller, name)?, time)
+        }
+        "boat_sail" => {
+            let sail = s
+                .game
+                .harbor
+                .boat
+                .as_ref()
+                .filter(|b| b.object == o.id && o.mode == game::boat::mode::SAILING);
+            match sail {
+                None => (library.state(controller, "Closed")?, 0.0),
+                Some(b) if b.sail_t < 0.875 => (library.state(controller, "Open")?, b.sail_t),
+                Some(b) => (library.state(controller, "Flapping")?, b.sail_t - 0.875),
+            }
+        }
+        _ => {
+            let state = library.default_state(controller)?;
+            (state, s.game.ticks as f32 * game::state::TICK * state.speed)
+        }
+    };
+    let name = state.clip.as_deref()?;
+    let clip = library.clip(name)?;
+    Some((name, elapsed + state.cycle_offset * clip.length))
+}
+
+fn sampled_node_pose(
+    s: &Session,
+    o: &game::level::Object,
+    proto: &game::data::Proto,
+    node: &game::data::TransformNode,
+    mut pose: game::animation::Pose,
+) -> game::animation::Pose {
+    for root in &proto.transforms {
+        let Some(controller) = root.animator.as_deref() else {
+            continue;
+        };
+        let Some(path) = game::data::animation_path(&node.path, &root.path) else {
+            continue;
+        };
+        if let Some((clip, time)) = object_animation(s, o, controller) {
+            if let Some(clip) = s.world.animations.clip(clip) {
+                pose = clip.pose(path, time, pose);
+            }
+        }
+    }
+    // orig: Catapult.Work rotates the disabled Animator's arm while cranking.
+    if proto.catapult.is_some()
+        && node.path == "Flippable/Arm"
+        && matches!(
+            o.mode,
+            game::siege::mode::MOVING | game::siege::mode::RELOADING
+        )
+    {
+        let angle = if o.mode == game::siege::mode::MOVING {
+            0.0
+        } else {
+            o.aim
+        };
+        let half = angle.to_radians() * 0.5;
+        pose.rotation = [0.0, 0.0, half.sin(), half.cos()];
+    }
+    pose
+}
+
+fn part_pose(
+    s: &Session,
+    o: &game::level::Object,
+    pi: usize,
+) -> (game::data::Affine2, game::animation::Pose) {
+    use game::data::Affine2;
+    let proto = &s.world.protos[o.proto as usize];
+    let part = &proto.parts[pi];
+    let color = o.parts[pi]
+        .color
+        .unwrap_or(part.color)
+        .map(|c| c as f32 / 255.0);
+    let sample = |node: &game::data::TransformNode| {
+        let mut pose = node.local;
+        if proto
+            .transforms
+            .get(part.node as usize)
+            .is_some_and(|n| core::ptr::eq(n, node))
+        {
+            pose.color = color;
+        }
+        sampled_node_pose(s, o, proto, node, pose)
+    };
+    let (mut transform, pose) = proto.sampled_transform(part.node, sample).unwrap_or((
+        Affine2 {
+            translation: [part.x, part.y],
+            ..part.transform
+        },
+        game::animation::Pose {
+            color,
+            ..Default::default()
+        },
+    ));
+    // orig: Catapult.Update ties the rope to Arm.TransformPoint(ArmAttach).
+    if proto.catapult.is_some()
+        && proto
+            .transforms
+            .get(part.node as usize)
+            .is_some_and(|n| n.path == "Flippable/Rope")
+    {
+        if let Some(index) = proto
+            .transforms
+            .iter()
+            .position(|n| n.path == "Flippable/Arm")
+        {
+            if let Some((arm, _)) = proto
+                .sampled_transform(index as u16, |n| sampled_node_pose(s, o, proto, n, n.local))
+            {
+                let end = arm.point([-0.125, 19.0 / 32.0]);
+                let [x, y] = [
+                    end[0] - transform.translation[0],
+                    end[1] - transform.translation[1],
+                ];
+                let length = (x * x + y * y).sqrt();
+                if length > 0.0 {
+                    // Four authored sprite pixels span the segment; positive
+                    // local X follows the rope, local Y stays perpendicular.
+                    transform.basis = [x * 8.0, -y / length, y * 8.0, x / length];
+                }
+            }
+        }
+    }
+    (transform, pose)
+}
+
 fn draw_part<R: Renderer>(c: &mut Ctx<R>, o: &game::level::Object, pi: usize) {
     let s = c.s;
     let st = o.parts[pi];
-    let Some(world_sprite) = st.sprite else {
-        return;
-    };
-    let Some(mut sprite) = c.sheet.world(world_sprite) else {
-        return;
-    };
+    let world_sprite = st.sprite;
+    let mut sprite = world_sprite.and_then(|id| c.sheet.world(id));
     let proto = &s.world.protos[o.proto as usize];
     // orig: PayableShield.status: the banner shows once a knight has the
     // shield, torn after the knight falls.
@@ -906,7 +1218,7 @@ fn draw_part<R: Renderer>(c: &mut Ctx<R>, o: &game::level::Object, pi: usize) {
                 _ => return,
             };
             if let Some(p) = pick.and_then(|p| c.sheet.world(p)) {
-                sprite = p;
+                sprite = Some(p);
             }
             if let Some(sh) = shop {
                 colors = (Color::rgb(sh.colors.0), Color::rgb(sh.colors.1));
@@ -915,8 +1227,41 @@ fn draw_part<R: Renderer>(c: &mut Ctx<R>, o: &game::level::Object, pi: usize) {
     }
     let part = &proto.parts[pi];
     let ratio = s.world.layer(o.layer).ratio;
-    let dir = if o.flip { -1.0 } else { 1.0 };
-    let (mut px, mut py) = (part.x, part.y);
+    // Catapult.Start resets root scale; only its Flippable subtree is mirrored.
+    // The two root-level wheel bodies retain their physical front/rear identity.
+    let catapult_mirrors_part = proto
+        .transforms
+        .get(part.node as usize)
+        .is_some_and(|n| n.path == "Flippable" || n.path.starts_with("Flippable/"));
+    let dir = if o.flip && (proto.catapult.is_none() || catapult_mirrors_part) {
+        -1.0
+    } else {
+        1.0
+    };
+    let (transform, pose) = part_pose(s, o, pi);
+    if !pose.visible {
+        return;
+    }
+    let (mut px, mut py) = (transform.translation[0], transform.translation[1]);
+    if let Some(node) = proto.transforms.get(part.node as usize) {
+        for root in &proto.transforms {
+            let Some(controller) = root.animator.as_deref() else {
+                continue;
+            };
+            let Some(path) = game::data::animation_path(&node.path, &root.path) else {
+                continue;
+            };
+            if let Some((clip, time)) = object_animation(s, o, controller) {
+                if let Some(frame) = c
+                    .sheet
+                    .clip(clip)
+                    .and_then(|clip| clip.sprite_frame(path, time))
+                {
+                    sprite = frame;
+                }
+            }
+        }
+    }
     // orig: Boat.sail animator: Closed until SailAway, then Open → Flapping;
     // the emblem rides on the cloth.
     if let Some(sail) = proto.boat.as_ref().and_then(|b| b.sail) {
@@ -935,33 +1280,37 @@ fn draw_part<R: Renderer>(c: &mut Ctx<R>, o: &game::level::Object, pi: usize) {
         let clip_def = c.clip(clip.0);
         if pi == sail as usize {
             if let Some(id) = clip_def.and_then(|k| k.sprite("", clip.1)) {
-                sprite = id;
+                sprite = Some(id);
             }
         } else if part.parent == Some(sail) {
             if sail_t.is_none() {
                 return;
             }
-            if let Some(k) = clip_def.filter(|k| k.has_offsets("Emblem")) {
+            if let Some(k) =
+                clip_def.filter(|k| proto.transforms.is_empty() && k.has_offsets("Emblem"))
+            {
                 let (ex, ey) = k.offset("Emblem", clip.1);
                 let sp = &proto.parts[sail as usize];
                 (px, py) = (sp.x + ex, sp.y + ey);
             }
         }
     }
-    let mut tint = Color::bytes(st.color.unwrap_or(part.color));
+    let mut tint = Color::rgba(pose.color);
     // orig: Banner.AssignColorAndPattern(): the coat of arms' pattern on the
     // cloth, and its emblem in the emblem color.
-    let name = &s.world.sprites[world_sprite as usize];
+    let name = world_sprite
+        .and_then(|id| s.world.sprites.get(id as usize))
+        .map_or("", String::as_str);
     let look = s.game.look;
     let mut cloth = heraldry::is_cloth(name);
     let emblem = if name.starts_with(heraldry::PATTERN) {
         if let Some(id) = heraldry::pattern(c.sheet, look) {
-            sprite = id;
+            sprite = Some(id);
         }
         false
     } else if name.starts_with(heraldry::EMBLEM) {
         if let Some(id) = heraldry::emblem(c.sheet, look) {
-            sprite = id;
+            sprite = Some(id);
         }
         true
     } else {
@@ -974,20 +1323,65 @@ fn draw_part<R: Renderer>(c: &mut Ctx<R>, o: &game::level::Object, pi: usize) {
     // orig: Ghost's animator (ghost_King / ghost_Queen) and SpriteFX fade;
     // it's the last monarch (`PreviousPlayerModel`, `PreviousPlayerColor`),
     // in their color with a pale `ghostColor` for skin.
-    if let Some(gh) = s.game.tutorial.ghost.as_ref().filter(|gh| gh.object == o.id) {
-        let clip = if look.queen { "ghost_Queen" } else { "ghost_King" };
+    if let Some(gh) = s
+        .game
+        .tutorial
+        .ghost
+        .as_ref()
+        .filter(|gh| gh.object == o.id)
+    {
+        let clip = if look.queen {
+            "ghost_Queen"
+        } else {
+            "ghost_King"
+        };
         if let Some(id) = c.frame(clip, gh.anim_t) {
-            sprite = id;
+            sprite = Some(id);
         }
         tint.a *= gh.alpha.clamp(0.0, 1.0);
         colors.1 = GHOST_COLOR;
         cloth = true;
     }
-    let at = layer_to_screen(s, o.x + dir * (px + st.shift), o.y + py, ratio);
+    let Some(sprite) = sprite else {
+        return;
+    };
+    let mut placed = game::data::Affine2 {
+        basis: [dir, 0.0, 0.0, 1.0],
+        translation: [0.0; 2],
+    }
+    .compose(game::data::Affine2 {
+        translation: [px + st.shift, py],
+        ..transform
+    });
+    if let Some(def) = proto.catapult.and_then(|d| d.recoil) {
+        let body = s.game.siege.recoil_pose(o.id, &def);
+        let wheel = proto
+            .transforms
+            .get(part.node as usize)
+            .and_then(|n| match n.path.as_str() {
+                "Wheel Front" => Some(0),
+                "Wheel Rear" => Some(1),
+                _ => None,
+            });
+        if let Some(wheel) = wheel {
+            placed = s.game.siege.wheel_pose(o.id, wheel, &def).compose(placed);
+        } else {
+            placed = body.compose(placed);
+        }
+    }
+    let at = layer_to_screen(
+        s,
+        o.x + placed.translation[0],
+        o.y + placed.translation[1],
+        ratio,
+    );
     if part.lit {
         tint = c.lit(tint);
     }
-    let mut d = Draw::tint(tint).flip(o.flip ^ st.flip);
+    let mut d = Draw::tint(tint)
+        .flip(st.flip)
+        .flip_y(part.flip_y)
+        .affine(placed.screen_basis(false));
     if part.recolor || cloth {
         // orig: Banner: recolorA = primary, recolorB = secondary (a cloth's
         // SpriteFX is recoloured whatever its material).
@@ -1148,10 +1542,15 @@ fn draw_troll<R: Renderer>(c: &mut Ctx<R>, i: usize) {
     use game::greed::EnemyKind;
     let s = c.s;
     let t = &s.game.greed.trolls[i];
+    let squid_visual = s.game.greed.squid_visual(t.id);
+    let throw_time = t.boss_throw_animation_time(&s.world);
     let clip = match (t.kind, t.state) {
+        (EnemyKind::Squid, _) if squid_visual.is_some() => squid_visual.unwrap().clip,
         (EnemyKind::Squid, TrollState::Dead { .. }) => "squid_death",
+        (EnemyKind::Squid, _) if t.grab_animation_time().is_some() => "squid_attack",
         (EnemyKind::Squid, _) => "squid_move",
         (EnemyKind::Boss | EnemyKind::KillerBoss, TrollState::Dead { .. }) => "boss_death",
+        (EnemyKind::Boss | EnemyKind::KillerBoss, _) if throw_time.is_some() => "boss_throw",
         (EnemyKind::Boss | EnemyKind::KillerBoss, _) if t.bash.is_some() => "boss_bash_right",
         (EnemyKind::Boss | EnemyKind::KillerBoss, _) if t.puke.is_some() => "boss_puke",
         (EnemyKind::Boss | EnemyKind::KillerBoss, _) if t.mover.vx.abs() < 0.05 => "boss_idle",
@@ -1165,25 +1564,54 @@ fn draw_troll<R: Renderer>(c: &mut Ctx<R>, i: usize) {
             _ => "troll_walk",
         },
     };
-    let Some(sprite) = c.frame(clip, t.anim_t) else {
-        return;
-    };
+    let mut animation_time = squid_visual.map_or_else(
+        || {
+            throw_time
+                .or_else(|| t.grab_animation_time())
+                .unwrap_or(t.anim_t)
+        },
+        |v| v.time,
+    );
     let mut tint = c.lit(WHITE);
     if let TrollState::Dead { t: dt } = t.state {
-        tint.a = (1.0 - (dt - 0.5).max(0.0)).max(0.0);
+        if t.kind.is_boss() {
+            // The Boss prefab does not FadeAndDestroy. Die holds its last
+            // frame until the ten-second pool despawn.
+            animation_time = dt;
+        } else {
+            tint.a = squid_visual
+                .map_or_else(|| (1.0 - (dt - 0.5).max(0.0)).max(0.0), |v| v.death_alpha);
+        }
     }
-    c.sprite_lit(
-        sprite,
-        world_to_screen(s, t.x, t.y),
-        Draw::tint(tint).flip(t.mover.facing < 0),
-    );
+    let Some(sprite) = c.frame(clip, animation_time) else {
+        return;
+    };
+    let mut draw = Draw::tint(tint).flip(t.mover.facing < 0);
+    if let Some(elapsed) = squid_visual.and_then(|v| v.overlay_elapsed) {
+        let mut overlay = Color::rgba(s.world.squid.spawn_overlay_color);
+        overlay.a *= (elapsed / 2.0).clamp(0.0, 1.0);
+        draw = draw.overlay(overlay);
+    }
+    c.sprite_lit(sprite, world_to_screen(s, t.x, t.y), draw);
+    if t.kind.is_boss() {
+        if let Some(boulder) = s
+            .game
+            .siege
+            .boulders
+            .iter()
+            .find(|b| b.runtime.held_by == Some(t.id))
+        {
+            let [x, y] = t.boss_hand(&s.world);
+            draw_boulder(c, x, y, boulder.spin);
+        }
+    }
     // What it carries. orig: Troll.PickupLoot puts it at (0.1875, 0.25) with x mirrored.
     if let Some(loot) = t.loot {
         let id = match loot {
             game::greed::Loot::Coin => c.sheet.id("coin_spin_0"),
             game::greed::Loot::Crown => c.sheet.id("crown"),
             game::greed::Loot::BoatPart(_) => c.sheet.id("boat_skeleton_s052_124"),
-            game::greed::Loot::Tool(k) => s
+            game::greed::Loot::Tool(k) | game::greed::Loot::CarriedTool { kind: k, .. } => s
                 .world
                 .tool_sprites
                 .get(k as usize)
@@ -1196,6 +1624,17 @@ fn draw_troll<R: Renderer>(c: &mut Ctx<R>, i: usize) {
             let at = world_to_screen(s, t.x + 0.1875 * f, t.y + 0.25);
             c.r.sprite(id, at, Draw::tint(tint).flip(t.mover.facing > 0));
         }
+    }
+}
+
+fn draw_boulder<R: Renderer>(c: &mut Ctx<R>, x: f32, y: f32, spin: f32) {
+    if let Some(sprite) = c.s.world.boulder_sprite {
+        let at = world_to_screen(c.s, x, y);
+        c.world_lit(
+            sprite,
+            at,
+            Draw::tint(c.lit(WHITE)).angle(spin.to_radians()),
+        );
     }
 }
 
@@ -1298,7 +1737,11 @@ fn draw_monarch<R: Renderer>(c: &mut Ctx<R>) {
     let Some(clip) = sheet.clip(&clip_name(&s.world.steeds[steed as usize].clips, s.anim.0)) else {
         return;
     };
-    let t = s.anim.1;
+    let t = if s.world.steeds[steed as usize].attacks_while_running && m.is_running() {
+        s.game.steed_animation_time()
+    } else {
+        s.anim.1
+    };
     let child = |path: &str| {
         let (ox, oy) = clip.offset(path, t);
         offset(root, ox * f, oy)
@@ -1395,22 +1838,19 @@ fn draw_celestial_glow<R: Renderer>(c: &mut Ctx<R>, i: usize, j: usize) {
     c.r.sprite(
         sp,
         celestial_screen(s, i),
-        Draw::tint(tint)
-            .scale(g.scale)
-            .additive()
-            .smooth(),
+        Draw::tint(tint).scale(g.scale).additive().smooth(),
     );
 }
 
-/// The night star field, fading with the blended `stars` level. orig:
-/// `Stars` (Heaven layer, camera-fixed); its layout isn't exported, so the
-/// field is procedural: fixed places, gentle per-star twinkle.
+/// Stars.SlowUpdate masks a fraction of the field. The port uses fixed
+/// procedural positions with twinkle for the visible portion of the sky.
 fn draw_stars<R: Renderer>(c: &mut Ctx<R>) {
-    let level = c.light().floats[float::STARS];
-    if level <= 0.004 {
+    use crate::session::STAR_COUNT;
+    let visible = c.s.visible_stars();
+    if visible == 0 {
         return;
     }
-    const STAR_COUNT: usize = 110;
+    let hidden = STAR_COUNT - visible;
     let t = c.s.t;
     let bottom = screen_y(0.0) - 10.0;
     let mut state = 0x9E37_79B9_u32;
@@ -1420,22 +1860,22 @@ fn draw_stars<R: Renderer>(c: &mut Ctx<R>) {
         state ^= state << 5;
         state
     };
-    for _ in 0..STAR_COUNT {
-        let (x, y, kind, rate, phase) =
-            (next(), next(), next(), next(), next());
+    for i in 0..STAR_COUNT {
+        let (x, y, kind, rate, phase) = (next(), next(), next(), next(), next());
+        if i < hidden {
+            continue;
+        }
         let x = 1.0 + (x >> 8) as f32 / (1 << 24) as f32 * (W - 2.0);
         let y = 3.0 + (y >> 8) as f32 / (1 << 24) as f32 * (bottom - 3.0).max(1.0);
         let big = kind >> 24 < 6; // every sixth star is a brighter 2×2 one
         let size = if big { 2.0 } else { 1.0 };
         // A slow triangle wave per star, 0..1; the field dips gently in and
         // out rather than blinking in step.
-        let w = t * (0.4 + (rate >> 8) as f32 / (1 << 24) as f32 * 0.8) + (phase >> 8) as f32 / (1 << 24) as f32;
+        let w = t * (0.4 + (rate >> 8) as f32 / (1 << 24) as f32 * 0.8)
+            + (phase >> 8) as f32 / (1 << 24) as f32;
         let twinkle = 1.0 - (w - w.floor()).abs() * 0.35;
-        let a = level * twinkle * if big { 1.0 } else { 0.7 };
-        if a <= 0.004 {
-            continue;
-        }
-        let (x, y) = (x.round(), y.round());
+        let a = twinkle * if big { 1.0 } else { 0.7 };
+        let (x, y) = (x.round(), y.round() + c.s.camera_shake_offset()[1] * PPU);
         c.r.rect(Rect::new(x, y, size, size), Color::new(1.0, 1.0, 1.0, a));
     }
 }
@@ -1461,7 +1901,12 @@ fn draw_dog<R: Renderer>(c: &mut Ctx<R>) {
 
 /// Everything on the top screen.
 pub fn draw(s: &Session, sheet: &Sheet, r: &mut impl Renderer) {
-    let mut c = Ctx { s, sheet, r, lights: Vec::new() };
+    let mut c = Ctx {
+        s,
+        sheet,
+        r,
+        lights: Vec::new(),
+    };
     draw_world(&mut c);
     draw_overlays(&mut c);
 }
@@ -1480,12 +1925,14 @@ fn draw_world<R: Renderer>(c: &mut Ctx<R>) {
     // the water reflects the sky (approximated until the reflection pass).
     c.r.depth(1.0);
     c.r.clear(sky_top);
-    gradient(c.r, SKY.1, SKY.2, sky_bottom, sky_top);
-    let below = screen_y(SKY.1);
+    gradient(s, c.r, SKY.1, SKY.2, sky_bottom, sky_top);
+    let below = world_row(s, SKY.1);
     c.r.rect(Rect::new(0.0, below, W, H - below), sky_bottom);
 
     let game_z = layer_z(&s.world);
-    let items = draw_list(s);
+    let particles: Vec<_> = s.boulder_particles.samples(&s.world).collect();
+    let clouds = cloud_draws(c, &light);
+    let items = draw_list_with_effects(s, &particles, &clouds);
     c.lights = items
         .iter()
         .filter_map(|(_, item)| fire_item(s, item))
@@ -1506,6 +1953,7 @@ fn draw_world<R: Renderer>(c: &mut Ctx<R>) {
             DrawItem::Coin(i) => draw_coin(c, i),
             DrawItem::Monarch => draw_monarch(c),
             DrawItem::Fill => gradient(
+                s,
                 c.r,
                 FILL.1,
                 FILL.2,
@@ -1520,13 +1968,23 @@ fn draw_world<R: Renderer>(c: &mut Ctx<R>) {
                 };
                 let haze = lit(Color::rgba(colors[color::HAZE]), &light);
                 if haze.a > 0.0 {
-                    gradient(c.r, b, t, haze, Color { a: 0.0, ..haze });
+                    gradient(s, c.r, b, t, haze, Color { a: 0.0, ..haze });
                 }
             }
             DrawItem::Water => draw_water(c),
             DrawItem::Celestial(i) => draw_celestial(c, i),
             DrawItem::Glow(i, j) => draw_celestial_glow(c, i, j),
             DrawItem::Stars => draw_stars(c),
+            DrawItem::Cloud(i) => {
+                let p = clouds[i].sample;
+                let at = layer_to_screen(s, p.position[0], p.position[1], 0.0);
+                let mut draw = Draw::tint(p.tint)
+                    .flip(p.flip)
+                    .affine([p.scale[0], 0.0, 0.0, p.scale[1]])
+                    .cloud_light(p.light);
+                draw.cloud_shadow = clouds[i].shadow;
+                c.world(p.sprite, at, draw);
+            }
             DrawItem::Grass(i) => draw_grass(c, i),
             DrawItem::Animal(i) => draw_animal(c, i),
             DrawItem::FreeSteed(i) => draw_free_steed(c, i),
@@ -1546,11 +2004,18 @@ fn draw_world<R: Renderer>(c: &mut Ctx<R>) {
             }
             DrawItem::Boulder(i) => {
                 let b = &s.game.siege.boulders[i];
-                if let Some(sp) = s.world.boulder_sprite {
-                    let at = world_to_screen(s, b.x, b.y);
-                    let tint = c.lit(WHITE);
-                    c.world_lit(sp, at, Draw::tint(tint).angle(b.spin.to_radians()));
-                }
+                draw_boulder(c, b.x, b.y, b.spin);
+            }
+            DrawItem::BoulderParticle(i) => {
+                let p = particles[i];
+                let at = world_to_screen(s, p.x, p.y);
+                c.world(
+                    p.sprite,
+                    at,
+                    Draw::tint(c.lit(Color::rgba(p.color)))
+                        .scale(p.scale)
+                        .angle(p.angle),
+                );
             }
         }
     }
@@ -1576,6 +2041,65 @@ fn draw_world<R: Renderer>(c: &mut Ctx<R>) {
     }
 }
 
+fn cloud_draws(c: &mut Ctx<'_, impl Renderer>, light: &Light) -> Vec<CloudDraw> {
+    let s = c.s;
+    let Some(def) = &s.world.clouds else {
+        return Vec::new();
+    };
+    let mut draws = Vec::new();
+    let mut sprites = Vec::new();
+    let mut receivers = 0;
+    for p in s.clouds.samples(&s.world, light) {
+        let Some(id) = c.sheet.world(p.sprite) else {
+            continue;
+        };
+        let sprite = c.sheet.get(id);
+        let extent = sprite.px.abs().max((f32::from(sprite.w) - sprite.px).abs());
+        // Keep a stereo margin. Offscreen casters can still shade visible clouds.
+        let visible = p.position[0].abs() * PPU <= W / 2.0 + extent * p.scale[0] + 16.0;
+        let mut slot = None;
+        if visible {
+            if p.kind == CloudKind::Cumulus && p.light.r.max(p.light.g).max(p.light.b) > 0.0 {
+                slot = cloud_shadow::atlas_slot(receivers, sprite);
+                receivers += usize::from(slot.is_some());
+            }
+            draws.push(CloudDraw {
+                sample: p,
+                shadow: slot,
+            });
+        }
+        if slot.is_some() || p.tint.a >= 0.5 {
+            sprites.push(cloud_shadow::Sprite {
+                id,
+                position: p.position,
+                scale: p.scale,
+                flip: p.flip,
+                opacity: p.tint.a,
+                slot,
+            });
+        }
+    }
+    if receivers > 0 {
+        let highest = s
+            .world
+            .celestials
+            .iter()
+            .map(|body| celestial_position(body, s.game.clock.time).1)
+            .fold(f32::NEG_INFINITY, f32::max);
+        if !highest.is_finite()
+            || !c.r.cloud_shadows(
+                cloud_shadow::Camera::new(def.cumulus.origin, highest),
+                &sprites,
+            )
+        {
+            for draw in &mut draws {
+                draw.shadow = None;
+            }
+        }
+    }
+    draws
+}
+
 /// How fast the water turns from mirror to `waterColor` with depth below
 /// the shore, in the shader's mesh `v` per world unit. orig: `Custom/Water`
 /// mixes by `(v + 0.2) × waterColor.a`; fitted against the PC's midday water
@@ -1595,7 +2119,7 @@ fn draw_water<R: Renderer>(c: &mut Ctx<R>) {
     let w = &s.world.water;
     let colors = s.game.blender.state.colors;
     let water = Color::rgba(colors[color::WATER]);
-    let horizon = screen_y(w.top);
+    let horizon = world_row(s, w.top);
     let light = &s.game.blender.state;
     let wet = (light.floats[float::RAIN] + light.floats[float::SNOW]).clamp(0.0, 1.0);
     let mirror = 1.0 - 0.8 * wet;
@@ -1619,7 +2143,11 @@ fn draw_water<R: Renderer>(c: &mut Ctx<R>) {
     };
     let ramp_end = (horizon + full).min(H);
     if ramp_end > horizon {
-        c.r.gradient(Rect::new(0.0, horizon, W, ramp_end - horizon), base(mix(0.0)), base(mix(ramp_end - horizon)));
+        c.r.gradient(
+            Rect::new(0.0, horizon, W, ramp_end - horizon),
+            base(mix(0.0)),
+            base(mix(ramp_end - horizon)),
+        );
     }
     if ramp_end < H {
         c.r.rect(Rect::new(0.0, ramp_end, W, H - ramp_end), base(1.0));
@@ -1629,8 +2157,8 @@ fn draw_water<R: Renderer>(c: &mut Ctx<R>) {
     let (mw, mh) = (w.size.0 as f32, w.size.1 as f32);
     // Texel column under the screen's centre: the band is `repeat.0` maps wide.
     let band_px = mw * w.repeat.0;
-    let centre = band_px / 2.0;
-    let bottom = screen_y(w.bottom).min(H);
+    let centre = band_px / 2.0 + s.camera_shake_offset()[0] * (0.25 * mw);
+    let bottom = world_row(s, w.bottom).min(H);
     let squash = w.reflection_scale.max(0.1);
     let mut y = horizon;
     while y < bottom {
@@ -1666,7 +2194,9 @@ fn centered<R: Renderer>(c: &mut Ctx<R>, text: &str, y: f32, size: f32) {
 /// Bottom-right: a spinning coin while saving, then the result, fading out.
 fn draw_save_notice<R: Renderer>(c: &mut Ctx<R>) {
     use crate::session::SaveNotice;
-    let Some(notice) = c.s.save_notice else { return };
+    let Some(notice) = c.s.save_notice else {
+        return;
+    };
     let (text, spin, left) = match notice {
         SaveNotice::Saving(..) => ("Saving", true, 1.0),
         SaveNotice::Saved(t) => ("Game saved", false, t),
@@ -1762,6 +2292,638 @@ fn draw_overlays<R: Renderer>(c: &mut Ctx<R>) {
 #[cfg(test)]
 mod tests {
     use super::sort_key;
+
+    #[derive(Default)]
+    struct Capture(Vec<(u32, (f32, f32), super::Draw)>, usize);
+    impl crate::render::Renderer for Capture {
+        fn clear(&mut self, _: super::Color) {
+            self.1 += 1;
+        }
+        fn sprite(&mut self, id: u32, at: (f32, f32), d: super::Draw) {
+            self.0.push((id, at, d));
+        }
+        fn sliced(&mut self, _: u32, _: super::Rect, _: (f32, f32, f32, f32), _: super::Color) {}
+        fn rect(&mut self, _: super::Rect, _: super::Color) {}
+        fn rect_lines(&mut self, _: super::Rect, _: f32, _: super::Color) {}
+        fn gradient(&mut self, _: super::Rect, _: super::Color, _: super::Color) {}
+        fn add(&mut self, _: super::Rect, _: super::Color) {}
+        fn circle(&mut self, _: f32, _: f32, _: f32, _: super::Color) {}
+        fn circle_lines(&mut self, _: f32, _: f32, _: f32, _: f32, _: super::Color) {}
+    }
+
+    fn transform_world() -> game::data::WorldData {
+        use game::data::*;
+        WorldData {
+            days: vec![DayDef {
+                name: "day".into(),
+                seasons: 7,
+                weathers: 1,
+                tracks: vec![],
+            }],
+            director: DirectorDef {
+                regular_days: vec![0],
+                boss_days: vec![0],
+                recovery_days: vec![0],
+                num_regular_days: (3, 4),
+                ..Default::default()
+            },
+            levels: vec![LevelConfigDef {
+                name: "island".into(),
+                autumn_start: (40, 40),
+                winter_start: (60, 60),
+                days_before_game_over: -1,
+                starting_coins: 0,
+                min_level_width: 0,
+                group_counts: vec![],
+                waves: Default::default(),
+                wave_timed_multiplier: 1.0,
+                wave_multiplier_timeframe: (0, -1),
+                season_change_days: 3.0,
+                income_multiplier: 1.0,
+                free_boat_parts: 0,
+                wave_boat_multiplier: 1.0,
+                force_all_unlocks: false,
+                defence_waves: [None; 3],
+                retaliation_waves: [None; 3],
+            }],
+            steeds: vec![Default::default()],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn squid_render_uses_saved_motion_phase_and_unlit_overlay_without_alpha_fade() {
+        use game::greed::{EnemyKind, SquidAnimation, SquidPhase, TrollState};
+        let mut s = super::Session::new(transform_world(), 0, 1, Default::default());
+        s.game
+            .greed
+            .spawn_troll(EnemyKind::Squid, 2., 1, false, &mut s.game.rng);
+        let mut runtime = s.game.greed.squid_states();
+        runtime[0].phase = SquidPhase::Despawning { elapsed: 0.8 };
+        runtime[0].animation = SquidAnimation::DiveOut;
+        runtime[0].animation_elapsed = 0.1;
+        assert!(s.game.greed.restore_squid_states(runtime, &s.world));
+        let mut sheet = super::Sheet::default();
+        for (id, name) in ["squid_move", "squid_dive_out", "squid_death"]
+            .into_iter()
+            .enumerate()
+        {
+            sheet.clips.push((
+                name.into(),
+                crate::sheet::Clip {
+                    length: 1.,
+                    sprites: vec![("".into(), vec![(0., Some(id as u32))])],
+                    ..Default::default()
+                },
+            ));
+            sheet.sprites.push(crate::sheet::Sprite {
+                page: 0,
+                x: 0,
+                y: 0,
+                w: 8,
+                h: 8,
+                px: 4.,
+                py: 4.,
+                masks: [None; 2],
+            });
+        }
+        sheet.link(&[]);
+        let capture = |s: &super::Session| {
+            let mut r = Capture::default();
+            super::draw_troll(
+                &mut super::Ctx {
+                    s,
+                    sheet: &sheet,
+                    r: &mut r,
+                    lights: vec![],
+                },
+                0,
+            );
+            r.0
+        };
+        let a = capture(&s);
+        assert_eq!(a[0].0, 1, "draw the controller's Dive Out, not always Move");
+        assert_eq!(a[0].2.tint.a, 1., "retreat changes color, not coverage");
+        let overlay = a[0].2.overlay.unwrap();
+        assert_eq!(overlay.r, s.world.squid.spawn_overlay_color[0]);
+        assert_eq!(
+            overlay.a, 0.4,
+            "two-second color ramp is interrupted by one-second despawn"
+        );
+        s.t += 100.;
+        assert_eq!(
+            capture(&s),
+            a,
+            "wall clock/render calls cannot advance a paused effect"
+        );
+        s.game = game::save::load_game(&game::save::save_game(&s.game, 17), 17, &s.world).unwrap();
+        assert_eq!(capture(&s), a, "save resumes controller and overlay phase");
+        s.game.greed.trolls[0].state = TrollState::Dead { t: 2.5 };
+        let dead = capture(&s);
+        assert_eq!(dead[0].0, 2);
+        assert_eq!(dead[0].2.tint.a, 0.5);
+    }
+
+    #[test]
+    fn reflection_parts_only_enter_the_extra_pass_without_clearing_the_copied_scene() {
+        use game::data::{Affine2, Layer, Part, Proto};
+        let mut w = transform_world();
+        w.sprites = vec!["hull".into(), "reflection".into()];
+        let normal = Part {
+            sprite: Some(0),
+            reflection_only: false,
+            x: 0.0,
+            y: 0.0,
+            z: 0.0,
+            flip: false,
+            flip_y: false,
+            transform: Affine2::IDENTITY,
+            node: 0,
+            color: [255; 4],
+            sort_layer: 0,
+            sort_order: 0,
+            random: None,
+            parent: None,
+            recolor: false,
+            lit: false,
+            scaffold: false,
+        };
+        let reflected = Part {
+            sprite: Some(1),
+            reflection_only: true,
+            x: 3.0,
+            y: 1.0,
+            ..normal.clone()
+        };
+        w.protos.push(Proto {
+            parts: vec![normal, reflected],
+            ..Default::default()
+        });
+        let mut s = super::Session::new(w, 0, 1, Default::default());
+        let mut object = game::level::instantiate(&s.world, 0, Layer::Game, 0.0, 0.0, 0.0, 1.0);
+        object.build = None;
+        s.game.level.add(object);
+        let mut sheet = super::Sheet::default();
+        sheet.names = vec!["hull".into(), "reflection".into()];
+        sheet.sprites = (0..2)
+            .map(|_| crate::sheet::Sprite {
+                page: 0,
+                x: 0,
+                y: 0,
+                w: 4,
+                h: 2,
+                px: 1.0,
+                py: 0.5,
+                masks: [None, None],
+            })
+            .collect();
+        sheet.link(&s.world.sprites);
+        assert!(!super::draw_list(&s)
+            .iter()
+            .any(|(_, item)| matches!(item, super::DrawItem::Part(0, 1))));
+        let mut normal = Capture::default();
+        super::draw(&s, &sheet, &mut normal);
+        assert_eq!(normal.0.iter().map(|p| p.0).collect::<Vec<_>>(), [0]);
+        let mut reflection = Capture::default();
+        super::draw_reflection_extras(&s, &sheet, &mut reflection);
+        assert_eq!(
+            reflection.1, 0,
+            "extra camera must preserve copied scene color"
+        );
+        assert_eq!(reflection.0.len(), 1);
+        assert_eq!(reflection.0[0].0, 1);
+        assert_eq!(reflection.0[0].1, super::layer_to_screen(&s, 3.0, 1.0, 1.0));
+        s.game.level.objects[0].flip = true;
+        let mut mirrored = Capture::default();
+        super::draw_reflection_extras(&s, &sheet, &mut mirrored);
+        assert_eq!(mirrored.0[0].1, super::layer_to_screen(&s, -3.0, 1.0, 1.0));
+        s.game.level.objects[0].parts[1].visible = false;
+        assert!(super::reflection_list(&s).is_empty());
+    }
+
+    #[test]
+    fn boat_sail_controller_uses_departure_clock_while_hull_floats() {
+        use game::animation::{
+            AnimatorState, Clip, Controller, Key, Pose, Tangent, TransformTrack,
+        };
+        use game::data::{Layer, Proto, TransformNode, WharfDef};
+        let mut w = transform_world();
+        w.protos.push(Proto::default());
+        w.protos.push(Proto {
+            wharf: Some(WharfDef {
+                boat: Some(0),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        // Exact controller/state separation from the exported PC assets:
+        // boat owns Float; boat_sail owns Closed -> Open -> Flapping.
+        for (controller, default_state) in [("boat", "Float"), ("boat_sail", "Closed")] {
+            w.animations.controllers.push(Controller {
+                name: controller.into(),
+                default_state: Some(default_state.into()),
+            });
+        }
+        for (controller, state, clip, length) in [
+            ("boat", "Float", "boat_float", 4.0),
+            ("boat_sail", "Closed", "boat_sail_closed", 1.0),
+            ("boat_sail", "Open", "boat_sail_open", 0.875),
+            ("boat_sail", "Flapping", "boat_sail_flapping", 1.0),
+        ] {
+            w.animations.states.push(AnimatorState {
+                controller: controller.into(),
+                name: state.into(),
+                clip: Some(clip.into()),
+                speed: 1.0,
+                ..Default::default()
+            });
+            let mut track = TransformTrack {
+                path: if controller == "boat_sail" {
+                    "Emblem"
+                } else {
+                    ""
+                }
+                .into(),
+                ..Default::default()
+            };
+            track.position[1] = [0.0, length]
+                .map(|time| Key {
+                    time,
+                    value: time,
+                    in_tangent: Tangent::Slope(1.0),
+                    out_tangent: Tangent::Slope(1.0),
+                })
+                .to_vec();
+            w.animations.clips.push((
+                clip.into(),
+                Clip {
+                    length,
+                    looping: matches!(state, "Float" | "Flapping"),
+                    tracks: vec![track],
+                    ..Default::default()
+                },
+            ));
+        }
+        let mut s = super::Session::new(w, 0, 1, Default::default());
+        let wharf = game::level::instantiate(&s.world, 1, Layer::Game, 0.0, 0.0, 0.0, 1.0);
+        s.game.level.add(wharf);
+        s.game.harbor = game::boat::Harbor::new(&s.world, &mut s.game.level, 0, &mut s.game.rng);
+        s.game
+            .harbor
+            .dev_finish(&s.world, &mut s.game.level, &mut s.game.rng);
+        let id = s.game.harbor.boat.as_ref().unwrap().object;
+        let i = s.game.level.index_of(id).unwrap();
+        let sail_controller = "AnimatorController/boat_sail.controller";
+        s.game.ticks = 120;
+        assert_eq!(
+            super::object_animation(&s, &s.game.level.objects[i], sail_controller),
+            Some(("boat_sail_closed", 0.0))
+        );
+        assert_eq!(
+            super::object_animation(
+                &s,
+                &s.game.level.objects[i],
+                "AnimatorController/boat.controller"
+            ),
+            Some(("boat_float", 2.0))
+        );
+
+        s.game.harbor.sail_away(&mut s.game.level).unwrap();
+        let sail = TransformNode {
+            path: "Sail".into(),
+            parent: None,
+            local: Pose::default(),
+            animator: Some(sail_controller.into()),
+        };
+        let emblem = TransformNode {
+            path: "Sail/Emblem".into(),
+            parent: Some(0),
+            local: Pose::default(),
+            animator: None,
+        };
+        let proto = Proto {
+            transforms: vec![sail, emblem.clone()],
+            ..Default::default()
+        };
+        for (sail_t, clip, elapsed) in [
+            (0.0, "boat_sail_open", 0.0),
+            (0.4375, "boat_sail_open", 0.4375),
+            (0.875, "boat_sail_flapping", 0.0),
+            (1.125, "boat_sail_flapping", 0.25),
+        ] {
+            s.game.harbor.boat.as_mut().unwrap().sail_t = sail_t;
+            assert_eq!(
+                super::object_animation(&s, &s.game.level.objects[i], sail_controller),
+                Some((clip, elapsed))
+            );
+            let pose = super::sampled_node_pose(
+                &s,
+                &s.game.level.objects[i],
+                &proto,
+                &emblem,
+                emblem.local,
+            );
+            assert_eq!(
+                pose.position[1], elapsed,
+                "emblem at departure time {sail_t}"
+            );
+        }
+    }
+
+    #[test]
+    fn catapult_draw_uses_three_body_poses_and_only_mirrors_flippable() {
+        use game::animation::Pose;
+        use game::data::{Affine2, CatapultDef, Layer, Part, Proto, TransformNode};
+        let mut w = transform_world();
+        w.sprites.push("body".into());
+        let def = game::recoil::Definition {
+            body_mass: 1.,
+            body_inertia: 1.,
+            wheel_mass: 1.,
+            wheel_radius: 1.,
+            front_anchor: [1., 1.],
+            rear_anchor: [-1., 1.],
+            gravity: 15.,
+            fixed_step: 0.02,
+            max_angular_speed: 6.0,
+            ..Default::default()
+        };
+        let part = Part {
+            sprite: Some(0),
+            reflection_only: false,
+            x: 0.,
+            y: 2.,
+            z: 0.,
+            flip: false,
+            flip_y: false,
+            transform: Affine2::IDENTITY,
+            node: 0,
+            color: [255; 4],
+            sort_layer: 0,
+            sort_order: 0,
+            random: None,
+            parent: None,
+            recolor: false,
+            lit: false,
+            scaffold: false,
+        };
+        w.protos.push(Proto {
+            catapult: Some(CatapultDef {
+                crank_rate: 0.1,
+                force: (1., 1.),
+                scan: (1., 10.),
+                hit_points: 1,
+                boulder_damage: 1,
+                stuck_probability: 0.,
+                spoon: (0., 2.),
+                recoil: Some(def),
+            }),
+            transforms: vec![
+                TransformNode {
+                    path: "Flippable/Body".into(),
+                    parent: None,
+                    local: Pose {
+                        position: [0., 2., 0.],
+                        ..Default::default()
+                    },
+                    animator: None,
+                },
+                TransformNode {
+                    path: "Wheel Rear".into(),
+                    parent: None,
+                    local: Pose {
+                        position: [-1., 1., 0.],
+                        ..Default::default()
+                    },
+                    animator: None,
+                },
+            ],
+            parts: vec![
+                part.clone(),
+                Part {
+                    x: -1.,
+                    y: 1.,
+                    node: 1,
+                    ..part
+                },
+            ],
+            ..Default::default()
+        });
+        let mut s = super::Session::new(w, 0, 1, Default::default());
+        s.camera_x = 0.;
+        let mut sheet = super::Sheet::default();
+        sheet.names = vec!["body".into()];
+        sheet.sprites = vec![crate::sheet::Sprite {
+            page: 0,
+            x: 0,
+            y: 0,
+            w: 4,
+            h: 2,
+            px: 1.,
+            py: 0.5,
+            masks: [None, None],
+        }];
+        sheet.link(&s.world.sprites);
+        for side in [1, -1] {
+            let o = game::level::instantiate(&s.world, 0, Layer::Game, 0., 0., 0., side as f32);
+            let mut physics = game::recoil::State::new(o.id, side, &def);
+            physics.bodies[0].angle = -(side as f32) * core::f32::consts::FRAC_PI_2;
+            // Give the rear wheel a distinct location/spin: it must not be
+            // reconstructed from chassis rotation or swapped when facing left.
+            physics.bodies[2].position = [3., 4.];
+            physics.bodies[2].angle = core::f32::consts::FRAC_PI_2;
+            s.game.siege.recoils = vec![physics];
+            let mut capture = Capture::default();
+            for part in 0..2 {
+                super::draw_part(
+                    &mut super::Ctx {
+                        s: &s,
+                        sheet: &sheet,
+                        r: &mut capture,
+                        lights: vec![],
+                    },
+                    &o,
+                    part,
+                );
+            }
+            for (actual, expected) in capture.0.iter().zip([(2. * side as f32, 2.), (3., 4.)]) {
+                let at = super::layer_to_screen(&s, expected.0, expected.1, 1.);
+                assert!((actual.1 .0 - at.0).abs() < 1e-4 && (actual.1 .1 - at.1).abs() < 1e-4);
+            }
+            assert!(capture.0[0].2.affine[0].abs() < 1e-6, "chassis rotates");
+            for (actual, expected) in capture.0[1].2.affine.into_iter().zip([0., 1., -1., 0.]) {
+                assert!(
+                    (actual - expected).abs() < 1e-6,
+                    "wheel uses its own spin, without mirroring"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn generic_part_draw_uses_animated_hierarchy_pivot_color_and_null_frames() {
+        use game::animation::{AnimatorState, Controller, Key, Pose, Tangent, TransformTrack};
+        use game::data::{Affine2, Layer, Part, Proto, TransformNode};
+        let mut w = transform_world();
+        w.sprites.push("panel".into());
+        let root = Pose {
+            scale: [2.0, 1.0, 1.0],
+            ..Default::default()
+        };
+        let child = Pose {
+            position: [1.0, 2.0, 0.0],
+            rotation: [
+                0.0,
+                0.0,
+                core::f32::consts::FRAC_1_SQRT_2,
+                core::f32::consts::FRAC_1_SQRT_2,
+            ],
+            ..Default::default()
+        };
+        let transform = Affine2::from_pose(root).compose(Affine2::from_pose(child));
+        w.protos.push(Proto {
+            name: "fixture".into(),
+            transforms: vec![
+                TransformNode {
+                    path: "".into(),
+                    parent: None,
+                    local: root,
+                    animator: Some("AnimatorController/fixture.controller".into()),
+                },
+                TransformNode {
+                    path: "Child".into(),
+                    parent: Some(0),
+                    local: child,
+                    animator: None,
+                },
+            ],
+            parts: vec![Part {
+                reflection_only: false,
+                sprite: Some(0),
+                x: 2.0,
+                y: 2.0,
+                z: 0.0,
+                flip: false,
+                flip_y: false,
+                transform,
+                node: 1,
+                color: [255; 4],
+                sort_layer: 0,
+                sort_order: 0,
+                random: None,
+                parent: None,
+                recolor: false,
+                lit: false,
+                scaffold: false,
+            }],
+            ..Default::default()
+        });
+        let key = |time, value| Key {
+            time,
+            value,
+            in_tangent: Tangent::Slope(0.0),
+            out_tangent: Tangent::Slope(0.0),
+        };
+        let mut track = TransformTrack {
+            path: "Child".into(),
+            ..Default::default()
+        };
+        track.position[0] = vec![key(0.0, 1.0), key(1.0, 3.0)];
+        track.scale[1] = vec![key(0.0, 3.0)];
+        track.color[3] = vec![key(0.0, 0.25)];
+        let animation = game::animation::Clip {
+            length: 1.0,
+            tracks: vec![track],
+            ..Default::default()
+        };
+        w.animations
+            .clips
+            .push(("motion".into(), animation.clone()));
+        w.animations.controllers.push(Controller {
+            name: "fixture".into(),
+            default_state: Some("Idle".into()),
+        });
+        w.animations.states.push(AnimatorState {
+            controller: "fixture".into(),
+            name: "Idle".into(),
+            clip: Some("motion".into()),
+            speed: 1.0,
+            ..Default::default()
+        });
+        let mut s = super::Session::new(w, 0, 1, Default::default());
+        s.game.ticks = 30;
+        let mut o = game::level::instantiate(&s.world, 0, Layer::Game, 0.0, 0.0, 0.0, 1.0);
+        let mut sheet = super::Sheet::default();
+        sheet.names.push("panel".into());
+        sheet.sprites.push(crate::sheet::Sprite {
+            page: 0,
+            x: 0,
+            y: 0,
+            w: 4,
+            h: 2,
+            px: 1.0,
+            py: 0.5,
+            masks: [None, None],
+        });
+        sheet.clips.push((
+            "motion".into(),
+            crate::sheet::Clip {
+                length: 1.0,
+                sprites: vec![("Child".into(), vec![(0.0, Some(0)), (1.0, None)])],
+                animation,
+                ..Default::default()
+            },
+        ));
+        sheet.link(&s.world.sprites);
+        let mut capture = Capture::default();
+        super::draw_part(
+            &mut super::Ctx {
+                s: &s,
+                sheet: &sheet,
+                r: &mut capture,
+                lights: vec![],
+            },
+            &o,
+            0,
+        );
+        let (_, at, d) = capture.0[0];
+        assert_eq!(at, super::layer_to_screen(&s, 4.0, 2.0, 1.0));
+        for (a, b) in d.affine.into_iter().zip([0.0, 6.0, -1.0, 0.0]) {
+            assert!((a - b).abs() < 1e-5);
+        }
+        assert_eq!(d.tint.a, 0.25);
+        let a = crate::render::sprite_corners(sheet.get(0), at, &d);
+        o.flip = true;
+        super::draw_part(
+            &mut super::Ctx {
+                s: &s,
+                sheet: &sheet,
+                r: &mut capture,
+                lights: vec![],
+            },
+            &o,
+            0,
+        );
+        let (_, at, d) = capture.0[1];
+        let b = crate::render::sprite_corners(sheet.get(0), at, &d);
+        let root_x = super::world_to_screen(&s, 0.0, 0.0).0;
+        for (a, b) in a.into_iter().zip(b) {
+            assert!((b.0 - (2.0 * root_x - a.0)).abs() < 1e-5);
+            assert_eq!(a.1, b.1);
+        }
+        s.game.ticks = 60;
+        super::draw_part(
+            &mut super::Ctx {
+                s: &s,
+                sheet: &sheet,
+                r: &mut capture,
+                lights: vec![],
+            },
+            &o,
+            0,
+        );
+        assert_eq!(capture.0.len(), 2, "authored null frame must stop drawing");
+    }
 
     /// The packed key orders exactly as the tuple compare it replaced.
     #[test]

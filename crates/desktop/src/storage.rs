@@ -31,21 +31,33 @@ impl Files {
 }
 
 impl platform::Storage for Files {
-    fn read(&self, slot: &str) -> Option<Vec<u8>> {
-        std::fs::read(self.path(slot)).ok()
+    fn read(&self, slot: &str) -> Result<Option<Vec<u8>>, platform::ReadError> {
+        platform::savefile::read(&self.path(slot))
+    }
+
+    fn read_backup(&self, slot: &str) -> Result<Option<Vec<u8>>, platform::ReadError> {
+        platform::savefile::read_backup(&self.path(slot))
     }
 
     fn write(&mut self, slot: &str, data: &[u8]) -> bool {
-        // Write beside it and rename, so a crash never leaves half a save.
-        let path = self.path(slot);
-        let tmp = path.with_extension("tmp");
         std::fs::create_dir_all(&self.dir).is_ok()
-            && std::fs::write(&tmp, data).is_ok()
-            && std::fs::File::open(&tmp).and_then(|f| f.sync_all()).is_ok()
-            && std::fs::rename(&tmp, &path).is_ok()
+            && platform::savefile::write(&self.path(slot), data).is_ok()
+    }
+
+    fn write_preserving_backup(&mut self, slot: &str, data: &[u8]) -> bool {
+        std::fs::create_dir_all(&self.dir).is_ok()
+            && platform::savefile::write_preserving_backup(&self.path(slot), data).is_ok()
     }
 
     fn delete(&mut self, slot: &str) {
-        let _ = std::fs::remove_file(self.path(slot));
+        let path = self.path(slot);
+        for p in [
+            path.clone(),
+            path.with_extension("sav.bak"),
+            path.with_extension("sav.tmp"),
+            path.with_extension("sav.old"),
+        ] {
+            let _ = std::fs::remove_file(p);
+        }
     }
 }

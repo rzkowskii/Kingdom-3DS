@@ -8,12 +8,13 @@
 //! setup); without it the game runs silent.
 
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::Read;
 
 use ctru_sys as ctru;
 use game::data::{AudioClipId, AudioDef};
 use scene::adpcm::{self, Adp};
 use scene::sound::{Mixer, Voice};
+use scene::stream;
 
 const CHANNELS: usize = 24;
 /// The soundtrack's two channels.
@@ -41,13 +42,7 @@ struct Clip {
 }
 
 struct Stream {
-    file: File,
-    /// Byte offset of each channel's frames.
-    offsets: [u64; 2],
-    stereo: bool,
-    samples: usize,
-    /// Next sample to queue.
-    next: usize,
+    source: stream::Source<File>,
     bufs: [[Box<ctru::ndspWaveBuf>; BUFFERS]; 2],
     data: [[*mut u8; BUFFERS]; 2],
     starts: [Box<ctru::ndspAdpcmData>; 2],
@@ -274,24 +269,11 @@ impl Audio {
 
     fn start_stream(&mut self, clip: AudioClipId, gain: f32) -> Option<Voice> {
         self.stop_stream();
-        let mut file = File::open(self.paths.get(clip as usize)?).ok()?;
-        let mut head = vec![0u8; adpcm::header_len(2)];
-        let n = file.read(&mut head).ok()?;
-        let a = Adp::header(&head[..n])?;
-        let len = adpcm::data_len(a.samples as usize) as u64;
-        let base = adpcm::header_len(a.channels.len()) as u64;
-        let stereo = a.channels.len() == 2;
-        // First frame headers: the decoder state each channel starts from.
-        let mut starts = [0u16; 2];
-        for (c, s) in starts.iter_mut().enumerate().take(a.channels.len()) {
-            let mut b = [0u8; 1];
-            file.seek(SeekFrom::Start(base + c as u64 * len)).ok()?;
-            file.read_exact(&mut b).ok()?;
-            *s = b[0] as u16;
-        }
-        if !stereo {
-            starts[1] = starts[0];
-        }
+        let file = File::open(self.paths.get(clip as usize)?).ok()?;
+        // Validate headers and the complete payload before allocating DSP memory.
+        let source = stream::Source::open(file).ok()?;
+        let a = &source.header;
+        let starts = source.starts;
         let alloc = || unsafe { ctru::linearAlloc(CHUNK_BYTES) } as *mut u8;
         let data = [[alloc(), alloc(), alloc()], [alloc(), alloc(), alloc()]];
         if data.iter().flatten().any(|p| p.is_null()) {
@@ -308,11 +290,8 @@ impl Audio {
         self.next += 1;
         let zero = || Box::new(unsafe { std::mem::zeroed::<ctru::ndspWaveBuf>() });
         let mut s = Stream {
-            file,
-            offsets: [base, if stereo { base + len } else { base }],
-            stereo,
-            samples: a.samples as usize,
-            next: 0,
+            gain: a.gain,
+            source,
             bufs: [[zero(), zero(), zero()], [zero(), zero(), zero()]],
             data,
             starts: starts.map(|index| {
@@ -323,11 +302,17 @@ impl Audio {
                 })
             }),
             id,
-            gain: a.gain,
         };
         // Queue every buffer on both channels before either plays much.
         for b in 0..BUFFERS {
-            Self::fill(&mut s, b);
+            match Self::fill(&mut s, b) {
+                Ok(true) => {}
+                Ok(false) => break,
+                Err(_) => {
+                    Self::clear_stream(s);
+                    return None;
+                }
+            }
         }
         let gain = gain * s.gain;
         self.stream = Some(s);
@@ -337,47 +322,51 @@ impl Audio {
         Some(id)
     }
 
-    /// Reads the next chunk into buffer `b` of both channels and queues it.
-    fn fill(s: &mut Stream, b: usize) -> bool {
-        if s.next >= s.samples {
-            return false;
-        }
-        let n = CHUNK.min(s.samples - s.next);
-        let bytes = adpcm::data_len(n);
-        let at = (s.next / adpcm::FRAME_SAMPLES * adpcm::FRAME_BYTES) as u64;
-        for c in 0..2 {
-            let dst = unsafe { std::slice::from_raw_parts_mut(s.data[c][b], bytes) };
-            let src = if s.stereo { c } else { 0 };
-            if s.file.seek(SeekFrom::Start(s.offsets[src] + at)).is_err()
-                || s.file.read_exact(dst).is_err()
-            {
-                return false;
+    /// Stage and flush both channels before either buffer becomes DSP-visible.
+    fn fill(s: &mut Stream, b: usize) -> std::io::Result<bool> {
+        let [left, right] = s
+            .data
+            .map(|channel| unsafe { std::slice::from_raw_parts_mut(channel[b], CHUNK_BYTES) });
+        let bufs = &mut s.bufs;
+        let starts = &mut s.starts;
+        s.source.fill_pair([left, right], CHUNK, |chunk, channels| {
+            for dst in channels {
+                let result =
+                    unsafe { ctru::DSP_FlushDataCache(dst.as_ptr() as *const _, dst.len() as u32) };
+                if result < 0 {
+                    return Err(std::io::Error::other("DSP stream cache flush failed"));
+                }
             }
-            let _ = unsafe { ctru::DSP_FlushDataCache(dst.as_ptr() as *const _, bytes as u32) };
-            let wb = &mut s.bufs[c][b];
-            **wb = unsafe { std::mem::zeroed() };
-            wb.__bindgen_anon_1.data_adpcm = s.data[c][b];
-            wb.nsamples = n as u32;
-            // Later buffers carry on from where the decoder is.
-            wb.adpcm_data = if s.next == 0 {
-                s.starts[c].as_mut() as *mut _
-            } else {
-                std::ptr::null_mut()
-            };
-            unsafe { ctru::ndspChnWaveBufAdd(MUSIC[c] as i32, wb.as_mut() as *mut _) };
+            for c in 0..2 {
+                let wb = &mut bufs[c][b];
+                **wb = unsafe { std::mem::zeroed() };
+                wb.__bindgen_anon_1.data_adpcm = channels[c].as_ptr() as *mut u8;
+                wb.nsamples = chunk.samples as u32;
+                wb.adpcm_data = if chunk.first {
+                    starts[c].as_mut() as *mut _
+                } else {
+                    std::ptr::null_mut()
+                };
+            }
+            for c in 0..2 {
+                unsafe { ctru::ndspChnWaveBufAdd(MUSIC[c] as i32, bufs[c][b].as_mut() as *mut _) };
+            }
+            Ok(())
+        })
+    }
+
+    fn clear_stream(s: Stream) {
+        for &ch in &MUSIC {
+            unsafe { ctru::ndspChnWaveBufClear(ch as i32) };
         }
-        s.next += n;
-        true
+        for p in s.data.iter().flatten() {
+            unsafe { ctru::linearFree(*p as *mut _) };
+        }
     }
 
     fn stop_stream(&mut self) {
         if let Some(s) = self.stream.take() {
-            for &ch in &MUSIC {
-                unsafe { ctru::ndspChnWaveBufClear(ch as i32) };
-            }
-            for p in s.data.iter().flatten() {
-                unsafe { ctru::linearFree(*p as *mut _) };
-            }
+            Self::clear_stream(s);
         }
     }
 
@@ -385,22 +374,32 @@ impl Audio {
     pub fn update(&mut self) {
         self.frame = self.frame.wrapping_add(1);
         let Some(s) = &mut self.stream else { return };
+        let mut failed = false;
         for b in 0..BUFFERS {
             let done = s.bufs[0][b].status == ctru::NDSP_WBUF_DONE as u8
                 && s.bufs[1][b].status == ctru::NDSP_WBUF_DONE as u8;
-            if done && !Self::fill(s, b) {
-                break;
+            if done {
+                match Self::fill(s, b) {
+                    Ok(true) => {}
+                    Ok(false) => break,
+                    Err(_) => {
+                        failed = true;
+                        break;
+                    }
+                }
             }
+        }
+        if failed {
+            self.stop_stream();
         }
     }
 
     fn stream_playing(&self) -> bool {
         self.stream.as_ref().is_some_and(|s| {
-            s.next < s.samples
-                || s.bufs[0].iter().any(|b| {
-                    b.status == ctru::NDSP_WBUF_QUEUED as u8
-                        || b.status == ctru::NDSP_WBUF_PLAYING as u8
-                })
+            s.source.playing(s.bufs.iter().flatten().any(|b| {
+                b.status == ctru::NDSP_WBUF_QUEUED as u8
+                    || b.status == ctru::NDSP_WBUF_PLAYING as u8
+            }))
         })
     }
 }

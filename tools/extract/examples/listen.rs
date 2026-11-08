@@ -26,7 +26,11 @@ impl Mixer for Log {
             if looping { " (loop)" } else { "" }
         );
         self.next += 1;
-        let end = if looping { f32::INFINITY } else { self.t + self.lens[clip as usize] };
+        let end = if looping {
+            f32::INFINITY
+        } else {
+            self.t + self.lens[clip as usize]
+        };
         self.live.push((self.next, end));
         Some(self.next)
     }
@@ -42,9 +46,13 @@ impl Mixer for Log {
 
 fn main() {
     let dir = std::env::args().nth(1).unwrap_or_else(|| "assets".into());
-    let secs: f32 = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(120.0);
+    let secs: f32 = std::env::args()
+        .nth(2)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(120.0);
     let dir = Path::new(&dir);
-    let world: WorldData = postcard::from_bytes(&std::fs::read(dir.join("world.bin")).unwrap()).unwrap();
+    let world: WorldData =
+        game::assetfile::decode_world(&std::fs::read(dir.join("world.bin")).unwrap()).unwrap();
     let mut sheet = Sheet::from_json(
         &std::fs::read_to_string(dir.join("sprites.json")).unwrap(),
         &std::fs::read_to_string(dir.join("clips.json")).unwrap(),

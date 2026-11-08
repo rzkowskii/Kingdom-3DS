@@ -2,6 +2,7 @@
 
 use alloc::vec::Vec;
 
+use crate::animation::EventKind;
 use crate::build::{self, PayKind, Tech, Upgraded};
 use crate::coins::{CoinEvent, Coins, Grabber, Wallet, Who};
 use crate::controls::Controls;
@@ -21,8 +22,10 @@ use crate::time::{Clock, DayCounter, DayEvent};
 use crate::units::{Ctx, FarmInfo, Population, SlotInfo, UnitEvent};
 use crate::wildlife::{Species, WildCtx, WildEvent, Wildlife};
 
-/// How often the bear swipes while galloping (its gallop clip's ability event).
-const BEAR_SWIPE_INTERVAL: f32 = 0.5;
+/// Canonical PC fallback for synthetic worlds without an extracted library.
+/// Shipped worlds use their actual override clip and controller state speed.
+const BEAR_GALLOP_LENGTH: f32 = 0.7666667;
+const BEAR_ABILITY_AT: f32 = 0.2;
 
 /// Fixed simulation step. Backends call [`GameState::tick`] at this rate.
 pub const TICK: f32 = 1.0 / 60.0;
@@ -65,6 +68,30 @@ pub enum GameEvent {
     Music(crate::data::SoundId),
     /// Two hired and a wall up: the ghost fades. orig: `TutorialManager.CompleteTutorial()`.
     TutorialDone,
+    /// Authored catapult markers, advanced by the simulation clock.
+    Siege(crate::siege::CatapultEvent),
+    BoulderBurst {
+        x: f32,
+        y: f32,
+        impact: bool,
+    },
+    /// Ground-relative positions. Lodging moves the shake origin after dust spawns.
+    BoulderImpact {
+        x: f32,
+        y: f32,
+        shake_y: f32,
+        side: i8,
+        collision_sound: bool,
+    },
+    BoulderFragments {
+        x: f32,
+        y: f32,
+        side: i8,
+    },
+    CameraShake {
+        x: f32,
+        y: f32,
+    },
 }
 
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -132,7 +159,7 @@ pub struct GameState {
     steed_ability: f32,
     /// Coins the unicorn still has to drop: (left, seconds to the next).
     poop: (u8, f32),
-    /// Seconds to the bear's next swipe while galloping.
+    /// Elapsed gallop clip time for bear markers (v7+); saved across resume.
     steed_attack: f32,
     /// orig: `Kingdom.coatOfArms`.
     pub coat: CoatOfArms,
@@ -180,7 +207,28 @@ pub struct GameState {
 impl GameState {
     /// Reject saved world indices before they can reach indexed access.
     pub(crate) fn ids_valid(&self, world: &WorldData) -> bool {
-        self.level_index < world.levels.len()
+        let carried_ids: Vec<u32> = self
+            .greed
+            .trolls
+            .iter()
+            .filter_map(|t| match t.loot {
+                Some(Loot::CarriedTool { id, .. }) => Some(id),
+                _ => None,
+            })
+            .collect();
+        let carried_valid = carried_ids.iter().enumerate().all(|(i, &id)| {
+            self.population.tool_id_allocated(id)
+                && !carried_ids[..i].contains(&id)
+                && !self.population.tools.iter().any(|t| t.id == id)
+                && !self.population.units.iter().any(|u| u.id == id)
+        });
+        let carried_shops_valid = self.greed.trolls.iter().all(|t| {
+            !matches!(t.loot, Some(Loot::CarriedTool { kind, shield_shop: Some(_), .. })
+                if kind != crate::data::ToolKind::Shield)
+        });
+        carried_valid
+            && carried_shops_valid
+            && self.level_index < world.levels.len()
             && (self.steed as usize) < world.steeds.len()
             && self
                 .mounts
@@ -778,51 +826,93 @@ impl GameState {
             self.steed_attack = 0.0;
             return;
         }
-        self.steed_attack -= dt;
-        if self.steed_attack > 0.0 {
-            return;
+        let speed = world
+            .animations
+            .state_speed("player_king", "Run")
+            .unwrap_or(1.0);
+        let before = self.steed_attack;
+        self.steed_attack += dt * speed;
+        let name = alloc::format!("{}_gallop", def.clips);
+        let attacks = world.animations.clip(&name).map_or_else(
+            || {
+                if world.animations.clips.is_empty() {
+                    crate::animation::event_occurrences(
+                        BEAR_ABILITY_AT,
+                        BEAR_GALLOP_LENGTH,
+                        true,
+                        before,
+                        self.steed_attack,
+                        before == 0.0,
+                    )
+                } else {
+                    0
+                }
+            },
+            |clip| {
+                clip.event_count(
+                    EventKind::TriggerAbility,
+                    before,
+                    self.steed_attack,
+                    before == 0.0,
+                )
+            },
+        );
+        for _ in 0..attacks {
+            let f = self.monarch.facing as f32;
+            let (hx, _, hw, _) = def.hit_box;
+            let (a, b) = (self.monarch.x + hx * f, self.monarch.x + (hx + hw) * f);
+            let (lo, hi) = (a.min(b), a.max(b));
+            let mut hit = false;
+            let trolls: Vec<usize> = (0..self.greed.trolls.len())
+                .filter(|&i| {
+                    let t = &self.greed.trolls[i];
+                    !t.is_dead() && t.x > lo && t.x < hi
+                })
+                .collect();
+            for i in trolls {
+                hit = true;
+                let mut ge = Vec::new();
+                self.greed.hurt(i, def.attack_damage, &mut |e| ge.push(e));
+                for effect in ge {
+                    self.apply_combat_effect(effect, events);
+                }
+            }
+            let animals: Vec<u32> = self
+                .wildlife
+                .animals
+                .iter()
+                .filter(|w| !w.is_dead() && w.x > lo && w.x < hi)
+                .map(|w| w.id)
+                .collect();
+            for id in animals {
+                hit = true;
+                let mut we = Vec::new();
+                self.wildlife.hurt(
+                    id,
+                    def.attack_damage,
+                    self.monarch.x,
+                    &mut self.coins,
+                    &mut self.rng,
+                    &mut |e| we.push(e),
+                );
+                events.extend(we.into_iter().map(GameEvent::Wild));
+            }
+            if hit {
+                self.monarch.stamina -= def.attack_stamina_cost;
+            }
         }
-        self.steed_attack = BEAR_SWIPE_INTERVAL;
-        let f = self.monarch.facing as f32;
-        let (hx, _, hw, _) = def.hit_box;
-        let (a, b) = (self.monarch.x + hx * f, self.monarch.x + (hx + hw) * f);
-        let (lo, hi) = (a.min(b), a.max(b));
-        let mut hit = false;
-        let trolls: Vec<usize> = (0..self.greed.trolls.len())
-            .filter(|&i| {
-                let t = &self.greed.trolls[i];
-                !t.is_dead() && t.x > lo && t.x < hi
-            })
-            .collect();
-        for i in trolls {
-            hit = true;
-            let mut ge = Vec::new();
-            self.greed.hurt(i, def.attack_damage, &mut |e| ge.push(e));
-            events.extend(ge.into_iter().map(GameEvent::Greed));
-        }
-        let animals: Vec<u32> = self
-            .wildlife
-            .animals
-            .iter()
-            .filter(|w| !w.is_dead() && w.x > lo && w.x < hi)
-            .map(|w| w.id)
-            .collect();
-        for id in animals {
-            hit = true;
-            let mut we = Vec::new();
-            self.wildlife.hurt(
-                id,
-                def.attack_damage,
-                self.monarch.x,
-                &mut self.coins,
-                &mut self.rng,
-                &mut |e| we.push(e),
-            );
-            events.extend(we.into_iter().map(GameEvent::Wild));
-        }
-        if hit {
-            self.monarch.stamina -= def.attack_stamina_cost;
-        }
+    }
+
+    /// The rendered gallop uses the same saved clip clock as its ability marker.
+    pub fn steed_animation_time(&self) -> f32 {
+        self.steed_attack
+    }
+
+    /// Pre-v7 saves stored a bear countdown and catapult's old release timing.
+    #[cfg(feature = "save")]
+    pub(crate) fn migrate_animation_clocks(&mut self) {
+        self.steed_attack = 0.0;
+        self.siege.migrate_animation_clocks();
     }
 
     /// Loaded ballistas aim at the toughest greed in front and fire.
@@ -919,12 +1009,19 @@ impl GameState {
                 (c.object, n)
             })
             .collect();
-        let enemies: Vec<(u32, f32)> = self
+        let enemies: Vec<_> = self
             .greed
             .trolls
             .iter()
             .filter(|t| !t.is_dead())
-            .map(|t| (t.id, t.x))
+            .map(|t| crate::siege::BoulderEnemy {
+                id: t.id,
+                x: t.x,
+                huge: t
+                    .kind
+                    .is_boss()
+                    .then(|| crate::coins::Rect::centered(0.75, 0.9, 1.5).at(t.x, t.y, false)),
+            })
             .collect();
         let hits = self.siege.update(
             dt,
@@ -934,12 +1031,193 @@ impl GameState {
             &pushers,
             &enemies,
             &mut self.rng,
+            |event| events.push(GameEvent::Siege(event)),
         );
-        for crate::siege::BoulderHit::Troll(id, damage) in hits {
+        for hit in hits {
+            let crate::siege::BoulderHit::Troll(id, damage) = hit else {
+                Self::boulder_effect(hit, events);
+                continue;
+            };
             if let Some(i) = self.greed.trolls.iter().position(|t| t.id == id) {
                 let mut ge = Vec::new();
                 self.greed.hurt(i, damage, &mut |e| ge.push(e));
-                events.extend(ge.into_iter().map(GameEvent::Greed));
+                for effect in ge {
+                    self.apply_combat_effect(effect, events);
+                }
+            }
+        }
+    }
+
+    fn boulder_effect(hit: crate::siege::BoulderHit, events: &mut Vec<GameEvent>) {
+        use crate::siege::BoulderHit;
+        match hit {
+            BoulderHit::Impact {
+                x,
+                y,
+                shake_y,
+                side,
+                collision_sound,
+            } => {
+                events.push(GameEvent::BoulderImpact {
+                    x,
+                    y,
+                    shake_y,
+                    side,
+                    collision_sound,
+                });
+            }
+            BoulderHit::Burst { x, y, side, impact } => {
+                events.push(GameEvent::BoulderFragments { x, y, side });
+                events.push(GameEvent::BoulderBurst { x, y, impact });
+            }
+            _ => {}
+        }
+    }
+
+    fn update_returned_boulders(
+        &mut self,
+        world: &WorldData,
+        dt: f32,
+        walls: &[crate::siege::BoulderWall],
+        events: &mut Vec<GameEvent>,
+    ) {
+        use crate::coins::Rect;
+        use crate::siege::{BoulderHit, BoulderTarget, BoulderTargetKind as Kind};
+
+        let trigger = |target, rect, takes_damage, huge| BoulderTarget {
+            target,
+            rect,
+            takes_damage,
+            huge,
+            physical: false,
+        };
+        let mut player = Rect::centered(0.61, 0.74, 1.14);
+        player.x -= 0.05;
+        let mut targets = alloc::vec![trigger(
+            Kind::Monarch,
+            player.at(self.monarch.x, self.monarch_y, self.monarch.facing < 0),
+            self.has_crown && !self.god,
+            false
+        )];
+        targets.extend(
+            self.population
+                .units
+                .iter()
+                .filter(|u| u.role != crate::data::Role::Beggar)
+                .map(|u| {
+                    let mut rect = Rect::centered(0.32, 0.33, 0.64);
+                    if u.role == crate::data::Role::Knight {
+                        rect = Rect::centered(0.45, 0.5, 0.9);
+                        rect.x += 0.07;
+                    }
+                    trigger(
+                        Kind::Unit(u.id),
+                        rect.at(u.x, u.y, u.mover.facing < 0),
+                        u.stunned <= 0.0,
+                        false,
+                    )
+                }),
+        );
+        targets.extend(self.merchants.list.iter().map(|m| {
+            let mut rect = Rect::centered(0.3, 0.69, 0.6);
+            rect.x -= 0.08;
+            trigger(
+                Kind::Object(m.object),
+                rect.at(m.mule_x, 0.0, m.mule.facing < 0),
+                true,
+                false,
+            )
+        }));
+        targets.extend(
+            self.wildlife
+                .animals
+                .iter()
+                .filter(|a| !a.is_dead())
+                .map(|a| {
+                    let rect = if a.species == Species::Bunny {
+                        Rect::centered(0.1, 0.26, 0.14).at(a.x, 0.0, false)
+                    } else {
+                        let (x0, y0, x1, y1) = a.hit_box();
+                        Rect {
+                            x: x0,
+                            y: y0,
+                            w: x1 - x0,
+                            h: y1 - y0,
+                        }
+                    };
+                    trigger(Kind::Wildlife(a.id), rect, true, false)
+                }),
+        );
+        targets.extend(self.greed.trolls.iter().filter(|t| !t.is_dead()).map(|t| {
+            let huge = t.kind.is_boss();
+            let rect = if huge {
+                Rect::centered(0.75, 0.9, 1.5).at(t.x, t.y, false)
+            } else {
+                t.box_at()
+            };
+            trigger(Kind::Enemy(t.id), rect, false, huge)
+        }));
+        for hit in self
+            .siege
+            .update_returned_boulders(dt, world, &targets, walls)
+        {
+            match hit {
+                BoulderHit::Returned {
+                    target: Kind::Monarch,
+                    damage,
+                    direction,
+                } => {
+                    self.hurt_monarch_heavy(damage, direction, events);
+                }
+                BoulderHit::Returned {
+                    target: Kind::Unit(id),
+                    damage,
+                    direction,
+                } => {
+                    self.population.hurt(
+                        id,
+                        damage,
+                        direction,
+                        &mut self.coins,
+                        &mut self.rng,
+                        &mut |e| events.push(GameEvent::Unit(e)),
+                    );
+                    self.payables_dirty = true;
+                }
+                BoulderHit::Returned {
+                    target: Kind::Object(id),
+                    damage,
+                    ..
+                } => {
+                    if self.merchants.list.iter().any(|m| m.object == id) {
+                        self.merchants.mule_hit(id, &mut self.coins, &mut self.rng);
+                    } else {
+                        self.hurt_wall(world, id, damage);
+                    }
+                }
+                BoulderHit::Returned {
+                    target: Kind::Wildlife(id),
+                    damage,
+                    direction,
+                } => {
+                    if let Some(x) = self
+                        .wildlife
+                        .animals
+                        .iter()
+                        .find(|a| a.id == id)
+                        .map(|a| a.x)
+                    {
+                        self.wildlife.hurt(
+                            id,
+                            damage,
+                            x - direction,
+                            &mut self.coins,
+                            &mut self.rng,
+                            &mut |e| events.push(GameEvent::Wild(e)),
+                        );
+                    }
+                }
+                effect => Self::boulder_effect(effect, events),
             }
         }
     }
@@ -1110,6 +1388,7 @@ impl GameState {
         self.monarch.stamina = 1.0;
         self.monarch.tired_timer = 0.0;
         self.steed_ability = 0.0;
+        self.steed_attack = 0.0;
         self.payables_dirty = true;
     }
 
@@ -1320,12 +1599,12 @@ impl GameState {
             events.push(GameEvent::Pay(PayEvent::DropCoin));
         }
 
-        let enemies: Vec<(u32, f32, f32, i32)> = self
+        let enemies: Vec<crate::units::EnemyTarget> = self
             .greed
             .trolls
             .iter()
             .filter(|t| !t.is_dead())
-            .map(|t| (t.id, t.x, t.mover.vx, t.hp))
+            .map(crate::units::EnemyTarget::from)
             .collect();
         let walls: Vec<f32> = self
             .level
@@ -1584,7 +1863,9 @@ impl GameState {
                     if let Some(i) = self.greed.trolls.iter().position(|t| t.id == troll) {
                         let mut ge = Vec::new();
                         self.greed.hurt(i, damage, &mut |e| ge.push(e));
-                        events.extend(ge.into_iter().map(GameEvent::Greed));
+                        for effect in ge {
+                            self.apply_combat_effect(effect, events);
+                        }
                     }
                 }
                 UnitEvent::Farmed(id) => {
@@ -1663,6 +1944,7 @@ impl GameState {
             match e {
                 // orig: EnemyManager.HandleOnDayStart (greed retreat), Kingdom.CheckBecomeSafe.
                 DayEvent::Started { .. } => {
+                    self.blender.clear_red_moon(world);
                     self.greed.dawn();
                     self.treasure.dawn();
                     self.safe = !self.greed.is_dangerous(self.borders);
@@ -1859,9 +2141,145 @@ impl GameState {
         self.queued.push(GameEvent::Won);
     }
 
+    /// Commit death effects before notifying presentation, regardless of which
+    /// attack produced them. Projectiles, bears, knights and siege all use this
+    /// path; forwarding only GameEvent::Greed would silently lose recovered loot
+    /// or citizens. orig: Troll.DropLoot / Squid.HandleOnDeath.
+    fn apply_combat_effect(&mut self, effect: GreedEvent, events: &mut Vec<GameEvent>) {
+        match effect {
+            GreedEvent::Released { x, count } => {
+                for _ in 0..count {
+                    self.population
+                        .spawn(crate::data::Role::Peasant, x, &mut self.rng);
+                }
+                self.payables_dirty = true;
+            }
+            GreedEvent::DroppedLoot { loot, x, y, .. } => {
+                match loot {
+                    Loot::Coin => {
+                        // Droppable.Drop replaces the dropper with the troll:
+                        // recovered coins must not recruit as player-dropped coins.
+                        self.coins.drop(
+                            Who::Thing,
+                            (x, y),
+                            (self.rng.range(-0.5, 0.5), 1.0),
+                            crate::coins::Policy::Anybody,
+                            None,
+                            None,
+                        );
+                    }
+                    Loot::Tool(kind) => {
+                        // A v5 save stores only the kind. Its missing old id
+                        // cannot be recovered, so allocate one in the normal domain.
+                        self.population.release_stolen_tool(kind, None, None, x, y);
+                    }
+                    Loot::CarriedTool {
+                        kind,
+                        id,
+                        shield_shop,
+                    } => {
+                        self.population
+                            .release_stolen_tool(kind, Some(id), shield_shop, x, y);
+                    }
+                    Loot::Crown | Loot::BoatPart(_) => {}
+                }
+                self.payables_dirty = true;
+            }
+            GreedEvent::Escaped {
+                loot:
+                    Some(Loot::CarriedTool {
+                        kind: crate::data::ToolKind::Shield,
+                        shield_shop: Some(shop),
+                        ..
+                    }),
+                ..
+            } => {
+                // DroppableShield.OnDisable frees its shop when the thief
+                // despawns. Pickup itself only reparents the still-live shield.
+                if let Some(s) = self
+                    .population
+                    .shields
+                    .iter_mut()
+                    .find(|s| s.object == shop)
+                {
+                    if s.status == crate::units::ShieldStatus::Available {
+                        s.status = crate::units::ShieldStatus::Empty;
+                        self.payables_dirty = true;
+                    }
+                }
+            }
+            _ => {}
+        }
+        events.push(GameEvent::Greed(effect));
+    }
+
     /// Troll targets, loot and the results of their attacks.
+    /// Actual layer-20 wall colliders, separate from damageable/attack targets.
+    /// WorkableBuilding disables its root while scaffolding is active.
+    fn squid_obstacles(
+        &self,
+        world: &WorldData,
+    ) -> (
+        Vec<crate::greed::ObstacleInfo>,
+        Vec<crate::data::ObstacleDef>,
+    ) {
+        let mut scans = Vec::new();
+        let mut solids = Vec::new();
+        for o in self
+            .level
+            .all()
+            .filter(|o| !build::under_construction(world, o))
+        {
+            let direction = if o.flip { -1.0 } else { 1.0 };
+            let transform = |p: [f32; 2]| [o.x + direction * p[0], o.y + p[1] - build::WALK_Y];
+            for collider in &world.protos[o.proto as usize].obstacles {
+                let points: Vec<_> = collider.points.iter().copied().map(transform).collect();
+                if points.is_empty() {
+                    continue;
+                }
+                let origin = transform(collider.origin);
+                let (mut min, mut max) = (points[0], points[0]);
+                for p in &points {
+                    for axis in 0..2 {
+                        min[axis] = min[axis].min(p[axis]);
+                        max[axis] = max[axis].max(p[axis]);
+                    }
+                }
+                scans.push(crate::greed::ObstacleInfo {
+                    object: o.id,
+                    x: origin[0],
+                    rect: crate::coins::Rect {
+                        x: min[0],
+                        y: min[1],
+                        w: max[0] - min[0],
+                        h: max[1] - min[1],
+                    },
+                });
+                solids.push(crate::data::ObstacleDef { origin, points });
+            }
+        }
+        (scans, solids)
+    }
+
     fn update_greed(&mut self, world: &WorldData, dt: f32, events: &mut Vec<GameEvent>) {
         use crate::coins::{Rect, MONARCH_BOX};
+        // PC Squid scans the Citizens layer independently of ground greed's
+        // damage targets. Embarked/inert and grabbed citizens have left this
+        // population; stunned peasants and elevated archers remain eligible.
+        let citizens: Vec<crate::greed::CitizenInfo> = self
+            .population
+            .units
+            .iter()
+            .filter(|u| u.role != crate::data::Role::Beggar)
+            .map(|u| crate::greed::CitizenInfo {
+                unit: u.id,
+                x: u.x,
+                y: u.y,
+                z: u.z,
+                rect: Rect::centered(0.32, 0.33, 0.64).at(u.x, u.y, false),
+                grabbable: u.role != crate::data::Role::Knight,
+            })
+            .collect();
         let mut targets: Vec<TargetInfo> = Vec::new();
         if self.has_crown {
             targets.push(TargetInfo {
@@ -1946,7 +2364,13 @@ impl GameState {
         let n_coins = self.coins.list.len();
         for (j, t) in self.population.tools.iter().enumerate() {
             loot.push(LootInfo {
-                loot: Loot::Tool(t.kind),
+                loot: Loot::CarriedTool {
+                    kind: t.kind,
+                    id: t.id,
+                    shield_shop: (t.kind == crate::data::ToolKind::Shield)
+                        .then_some(t.shop)
+                        .flatten(),
+                },
                 x: t.x,
                 y: t.y,
                 index: n_coins + j,
@@ -1978,6 +2402,7 @@ impl GameState {
         }
         let portals = Greed::portals_in(world, &self.level);
         let portal_infos = self.portal_hit_infos(world);
+        let (obstacles, solid_obstacles) = self.squid_obstacles(world);
         let mut threats = alloc::vec![self.monarch.x];
         threats.extend(
             self.population
@@ -1992,6 +2417,8 @@ impl GameState {
                 .map(|u| u.x),
         );
         let ctx = GreedCtx {
+            obstacles: &obstacles,
+            solid_obstacles: &solid_obstacles,
             portal_infos: &portal_infos,
             threats: &threats,
             season: self.season,
@@ -2004,27 +2431,42 @@ impl GameState {
             monarch_x: self.monarch.x,
             monarch_has_crown: self.has_crown,
             targets: &targets,
+            citizens: &citizens,
             loot: &loot,
             portals: &portals,
         };
         let mut out: Vec<GreedEvent> = Vec::new();
         let hours = self.clock.date();
-        self.greed
-            .update(dt, hours, &ctx, &self.level, &mut self.rng, |e| out.push(e));
+        self.siege.identify_boulders();
+        self.greed.update(
+            dt,
+            hours,
+            &ctx,
+            &self.level,
+            &mut self.siege.boulders,
+            &mut self.rng,
+            |e| out.push(e),
+        );
+        self.siege.boulders.retain(|b| {
+            b.runtime
+                .held_by
+                .is_none_or(|owner| self.greed.trolls.iter().any(|t| t.id == owner))
+        });
 
         let mut coin_removals: Vec<usize> = Vec::new();
         let mut part_removals: Vec<usize> = Vec::new();
         let mut tool_removals: Vec<usize> = Vec::new();
-        for e in out {
+        for &e in &out {
             match e {
+                GreedEvent::BossWaveSpawned { .. } => self.blender.start_red_moon(world),
+                GreedEvent::BossBashImpact { x, y } => events.push(GameEvent::CameraShake { x, y }),
                 GreedEvent::Hit { by, target, damage } => {
-                    let dir = self
-                        .greed
-                        .trolls
-                        .iter()
-                        .find(|t| t.id == by)
-                        .map_or(1.0, |t| t.mover.facing as f32);
+                    let attacker = self.greed.trolls.iter().find(|t| t.id == by);
+                    let dir = attacker.map_or(1.0, |t| t.mover.facing as f32);
                     match target {
+                        Target::Monarch if attacker.is_some_and(|t| t.kind.is_boss()) => {
+                            self.hurt_monarch_heavy(damage, dir, events);
+                        }
                         Target::Monarch => self.hurt_monarch(damage, dir, events),
                         Target::Unit(id) => {
                             let mut ue = Vec::new();
@@ -2052,6 +2494,7 @@ impl GameState {
                                 self.level.objects[i].hp -= damage;
                                 if self.level.objects[i].hp <= 0 {
                                     self.level.objects.remove(i);
+                                    self.siege.remove(id);
                                     self.payables_dirty = true;
                                 }
                             }
@@ -2084,13 +2527,6 @@ impl GameState {
                     }
                     self.payables_dirty = true;
                 }
-                // orig: Character.Release: the carried peasants drop back down.
-                GreedEvent::Released { x, count } => {
-                    for _ in 0..count {
-                        self.population
-                            .spawn(crate::data::Role::Peasant, x, &mut self.rng);
-                    }
-                }
                 // orig: EnemyManager.OnEnemiesSpawned → the dog barks that way.
                 GreedEvent::PortalOpened(object) => {
                     if let Some(i) = self.level.index_of(object) {
@@ -2122,7 +2558,6 @@ impl GameState {
                 }
                 _ => {}
             }
-            events.push(GameEvent::Greed(e));
         }
         coin_removals.sort_unstable();
         for i in coin_removals.into_iter().rev() {
@@ -2136,9 +2571,30 @@ impl GameState {
         }
         tool_removals.sort_unstable();
         for i in tool_removals.into_iter().rev() {
-            let t = self.population.tools.remove(i);
-            self.population.tool_lost(&t);
+            // The shield's shop remains occupied while its live droppable is
+            // carried. Only an escape destroys it and releases the stock slot.
+            self.population.tools.remove(i);
             self.payables_dirty = true;
+        }
+
+        // A projectile can kill the thief during the very tick it picks up
+        // a tool. Commit all pickups first so the recovery cannot collide
+        // with the original tool's still-present identity.
+        for effect in out {
+            self.apply_combat_effect(effect, events);
+        }
+
+        if self.siege.boulders.iter().any(|b| b.runtime.hostile) {
+            let walls: Vec<_> = obstacles
+                .into_iter()
+                .zip(solid_obstacles)
+                .filter(|(scan, _)| self.level.index_of(scan.object).is_some())
+                .map(|(scan, polygon)| crate::siege::BoulderWall {
+                    object: scan.object,
+                    polygon,
+                })
+                .collect();
+            self.update_returned_boulders(world, dt, &walls, events);
         }
 
         // orig: the monarch picks the crown back up by touching it.
@@ -2227,6 +2683,8 @@ impl GameState {
         }
         self.level.objects[i].hp -= damage;
         if self.level.objects[i].hp > 0 {
+            self.greed
+                .portal_hit(object, &mut |e| events.push(GameEvent::Greed(e)));
             return;
         }
         let mut out = Vec::new();
@@ -2256,6 +2714,23 @@ impl GameState {
 
     /// orig: `Player.HandleOnReceiveDamage()`: coins fly out (half into the
     /// water); with none left, the crown falls off.
+    fn hurt_monarch_heavy(&mut self, damage: i32, dir: f32, events: &mut Vec<GameEvent>) {
+        // Damageable becomes invulnerable after crown loss. The collider can
+        // still count against a boulder's target limit.
+        if self.god || !self.has_crown {
+            return;
+        }
+        if self.passenger.is_some() {
+            self.dump_passenger();
+        } else {
+            self.hurt_monarch(damage, dir, events);
+        }
+        events.push(GameEvent::CameraShake {
+            x: self.monarch.x,
+            y: self.monarch_y,
+        });
+    }
+
     fn hurt_monarch(&mut self, damage: i32, dir: f32, events: &mut Vec<GameEvent>) {
         if self.god {
             return;
@@ -2706,6 +3181,198 @@ mod tests {
         ev
     }
 
+    fn red_moon_fixture(boss_wave: bool) -> (WorldData, GameState, u32) {
+        use crate::lighting::{color, float};
+        let mut w = fight_world();
+        w.steeds.push(Default::default());
+        w.protos.push(Proto {
+            portal: Some(crate::data::PortalDef {
+                cliff: false,
+                hit_points: 100,
+                by_arrows: true,
+                by_knights: true,
+                hit_box: (-1.0, 1.0, 0.0, 2.0),
+                defense_range: 2.0,
+                defense_delay: (0.0, 0.0),
+                defense_cooldown: 8.0,
+                rebuild_days: 0.0,
+                rift: None,
+            }),
+            ..Default::default()
+        });
+        let mut base = crate::data::LightPreset {
+            name: "Clear Night".into(),
+            category: 1,
+            weather: 1,
+            season: 1,
+            part_of_day: 3,
+            test_only: false,
+            enabled: u32::MAX,
+            colors: [[0.25; 4]; 17],
+            floats: [0.0; 8],
+        };
+        base.colors[color::MOON_TINT] = [1.0; 4];
+        base.floats[float::STARS] = 1.0;
+        let mut red = base.clone();
+        red.name = "Red Moon".into();
+        red.category = 0;
+        red.enabled = 0x0040_6c00;
+        red.colors[color::MOON_TINT] = [0.6, 0.2, 0.1, 1.0];
+        red.floats[float::STARS] = 0.0;
+        w.lights = vec![base, red];
+        w.director.initial_lights = vec![0];
+        w.red_moon = Some(1);
+        // No enemy on this day, so admission must depend on the flag alone.
+        w.waves.push(crate::data::WaveDef {
+            boss_wave,
+            ..Default::default()
+        });
+        w.levels[0].waves[1] = [Some(0); 3];
+        let mut g = GameState::new(&w, 0, 23);
+        g.campfire = 0.0;
+        g.monarch.x = -100.0;
+        g.borders = Borders {
+            left: 0.0,
+            right: 0.0,
+        };
+        // 50 units at the empty wave's default speed of 5 gives one hour
+        // travel time, so the midnight spawn follows the 18:00 opening.
+        let portal = g
+            .level
+            .add(level::instantiate(&w, 1, Layer::Game, 50.0, 1.0, 0.0, 1.0));
+        g.greed.schedule(
+            &w,
+            &g.level,
+            0,
+            WaveKind::Boss,
+            Season::Summer,
+            0,
+            g.campfire,
+            g.borders,
+            &mut g.rng,
+        );
+        (w, g, portal)
+    }
+
+    #[test]
+    fn red_moon_waits_for_a_live_portal_to_accept_the_authored_boss_flag() {
+        for (boss, removed, destroyed) in [
+            (true, false, false),
+            (false, false, false),
+            (true, true, false),
+            (true, false, true),
+        ] {
+            let (w, mut g, portal) = red_moon_fixture(boss);
+            let mut events = Vec::new();
+            g.clock.time = 19.0;
+            g.update_greed(&w, 0.0, &mut events);
+            assert!(events.contains(&GameEvent::Greed(GreedEvent::PortalOpened(portal))));
+            assert_eq!(
+                g.blender.presets().count(),
+                1,
+                "opening cannot start the overlay"
+            );
+            if removed {
+                g.level.remove_any(portal);
+            }
+            if destroyed {
+                g.greed.portal_destroyed(portal, false, 0.0, &mut |_| {});
+            }
+            events.clear();
+            g.clock.day = 1;
+            g.clock.time = 0.0;
+            g.update_greed(&w, 0.0, &mut events);
+            let admitted = boss && !removed && !destroyed;
+            assert_eq!(
+                events.contains(&GameEvent::Greed(GreedEvent::BossWaveSpawned { portal })),
+                admitted
+            );
+            assert_eq!(g.blender.presets().count(), if admitted { 2 } else { 1 });
+            assert!(g.greed.trolls.is_empty());
+        }
+    }
+
+    #[test]
+    fn red_moon_dawn_fades_during_an_attack_and_load_rebinds_the_exiting_fader() {
+        let (w, mut g, _) = red_moon_fixture(true);
+        g.clock.day = 1;
+        g.clock.time = 0.0;
+        g.update_greed(&w, 0.0, &mut Vec::new());
+        g.blender.update(&w, 4.0);
+        assert_eq!(g.blender.presets().last(), Some((1, 0.4)));
+        g.greed
+            .spawn_troll(crate::greed::EnemyKind::Boss, 50.0, 1, true, &mut g.rng);
+        g.clock.time = crate::time::DAY_START + 0.01;
+        let mut events = Vec::new();
+        g.tick(&w, &Controls::default(), &mut events);
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, GameEvent::Day(DayEvent::Started { .. }))));
+        assert!(!g.greed.trolls[0].is_dead());
+        let dawn_weight = g.blender.presets().last().unwrap().1;
+        g.blender.update(&w, 5.0);
+        assert!((g.blender.presets().last().unwrap().1 - dawn_weight * 0.5).abs() < 1e-6);
+
+        #[cfg(feature = "save")]
+        {
+            let bytes = crate::save::save_game(&g, 73);
+            let mut resumed = crate::save::load_game(&bytes, 73, &w).unwrap();
+            assert_eq!(crate::save::save_game(&resumed, 73), bytes);
+            let mut unmodified = resumed.clone();
+            unmodified.blender.update(&w, 5.0);
+            assert_eq!(
+                unmodified.blender.presets().collect::<Vec<_>>(),
+                vec![(0, 1.0)]
+            );
+            resumed.blender.start_red_moon(&w);
+            resumed.blender.update(&w, 5.0);
+            assert_eq!(
+                resumed.blender.presets().count(),
+                2,
+                "PC reload rebinds the fading fader"
+            );
+            assert!(
+                (resumed.blender.presets().last().unwrap().1 - (0.5 + dawn_weight * 0.25)).abs()
+                    < 1e-6
+            );
+        }
+        g.blender.update(&w, 5.0);
+        assert_eq!(g.blender.presets().collect::<Vec<_>>(), vec![(0, 1.0)]);
+    }
+
+    #[test]
+    fn flagged_retaliation_lights_the_moon_but_portal_defense_does_not() {
+        let (mut w, mut g, destroyed) = red_moon_fixture(true);
+        w.levels[0].defence_waves = [Some(0); 3];
+        w.levels[0].retaliation_waves = [Some(0); 3];
+        let defender = g.level.add(level::instantiate(
+            &w,
+            1,
+            Layer::Game,
+            -50.0,
+            1.0,
+            0.0,
+            -1.0,
+        ));
+        g.monarch.x = -50.0;
+        g.greed.portal_hit(defender, &mut |_| {});
+        g.update_greed(&w, 1.0, &mut Vec::new());
+        g.update_greed(&w, 1.0, &mut Vec::new());
+        assert_eq!(g.blender.presets().count(), 1);
+
+        g.greed.portal_destroyed(destroyed, false, 0.0, &mut |_| {});
+        g.level.remove_any(destroyed);
+        let mut events = Vec::new();
+        g.update_greed(&w, 30.0, &mut events);
+        assert!(events.contains(&GameEvent::Greed(GreedEvent::Retaliation)));
+        assert!(
+            events.contains(&GameEvent::Greed(GreedEvent::BossWaveSpawned {
+                portal: defender
+            }))
+        );
+        assert_eq!(g.blender.presets().last(), Some((1, 0.0)));
+    }
+
     #[test]
     fn trolls_break_down_a_wall() {
         let w = fight_world();
@@ -3077,6 +3744,61 @@ mod tests {
         assert!(g.level.index_of(chest).is_none(), "fades 10 s after");
     }
 
+    #[cfg(feature = "save")]
+    #[test]
+    fn catapult_death_retires_recoil_before_a_same_tick_save() {
+        let mut w = fight_world();
+        w.steeds.push(Default::default());
+        let mut cat = wall_proto("Catapult", 1, None, 0);
+        cat.payable = None;
+        cat.upgrade = None;
+        cat.catapult = Some(crate::data::CatapultDef {
+            crank_rate: 0.1,
+            force: (7.0, 9.0),
+            scan: (2.0, 7.5),
+            hit_points: 1,
+            boulder_damage: 15,
+            stuck_probability: 0.5,
+            spoon: (0.19, 1.03),
+            recoil: Some(crate::recoil::fixture()),
+        });
+        w.protos.push(cat);
+        let mut counter = wall_proto("Workshop Right", 6, None, 0);
+        counter.upgrade = None;
+        counter.workshop_side = Some((1, 1));
+        w.protos.push(counter);
+        let mut g = GameState::new(&w, 0, 5);
+        g.monarch.x = -10.0;
+        let counter = g
+            .level
+            .add(level::instantiate(&w, 2, Layer::Game, 0.0, 0.0, 0.1, 1.0));
+        g.siege.order(&w, &mut g.level, counter);
+        let id = g.siege.catapults[0].object;
+        let i = g.level.index_of(id).unwrap();
+        g.level.objects[i].hp = 1;
+        g.level.objects[i].build = None;
+        g.update_siege(&w, TICK, &mut Vec::new());
+        assert_eq!(g.siege.recoils.len(), 1);
+        g.siege.recoils[0].impact(&crate::recoil::fixture());
+        let x = g.level.objects[g.level.index_of(id).unwrap()].x;
+        g.greed
+            .spawn_troll(crate::greed::EnemyKind::Troll, x, 1, false, &mut g.rng);
+        g.greed.trolls[0].state = crate::greed::TrollState::Charge {
+            t: 0.0,
+            landed: false,
+            hit: false,
+            recover: 1.0,
+        };
+        // Real greed collision and GameState's death dispatcher, with no
+        // following siege tick to clean up a stale sidecar for the test.
+        g.update_greed(&w, TICK, &mut Vec::new());
+        assert!(g.level.index_of(id).is_none());
+        assert!(g.siege.catapults.is_empty() && g.siege.recoils.is_empty());
+        assert!(g.ids_valid(&w));
+        let restored = crate::save::load_game(&crate::save::save_game(&g, 42), 42, &w).unwrap();
+        assert!(restored.siege.recoils.is_empty());
+    }
+
     #[test]
     fn builders_push_and_crank_a_catapult_that_crushes_greed() {
         let mut w = fight_world();
@@ -3091,6 +3813,7 @@ mod tests {
             boulder_damage: 15,
             stuck_probability: 0.5,
             spoon: (0.19, 1.03),
+            recoil: None,
         });
         w.protos.push(cat);
         let mut counter = wall_proto("Workshop Right", 6, None, 0);
@@ -3118,6 +3841,8 @@ mod tests {
         let cat = g.siege.catapults[0].object;
         let o = &g.level.objects[g.level.index_of(cat).unwrap()];
         assert_eq!(o.mode, crate::siege::mode::READY, "aim {}", o.aim);
+        let mut recovery = g.clone();
+        let target_x = o.x + 5.0;
         g.greed.spawn_troll(
             crate::greed::EnemyKind::ToughTroll,
             9.0,
@@ -3129,6 +3854,45 @@ mod tests {
         assert!(ev
             .iter()
             .any(|e| matches!(e, GameEvent::Greed(GreedEvent::Killed(_)))));
+
+        // Exercise the same production collision/dispatch with a captive
+        // carrier. Position the fired boulder at its impact frame so the
+        // squid's flight AI cannot make this regression depend on aim tuning.
+        recovery.greed.spawn_troll(
+            crate::greed::EnemyKind::Squid,
+            target_x,
+            1,
+            false,
+            &mut recovery.rng,
+        );
+        recovery.greed.trolls[0].hp = 1;
+        recovery.greed.trolls[0].victims = 2;
+        recovery.greed.trolls[0].loot = Some(Loot::Coin);
+        let mut ev = Vec::new();
+        for _ in 0..60 {
+            recovery.update_siege(&w, TICK, &mut ev);
+        }
+        let boulder = recovery.siege.boulders.first_mut().expect("catapult fired");
+        boulder.x = target_x;
+        boulder.y = 0.3;
+        boulder.vx = 0.0;
+        boulder.vy = 0.0;
+        recovery.update_siege(&w, TICK, &mut ev);
+        assert_eq!(recovery.population.count(Role::Peasant), 2);
+        assert_eq!(
+            ev.iter()
+                .filter(|e| matches!(
+                    e,
+                    GameEvent::Greed(GreedEvent::DroppedLoot {
+                        loot: Loot::Coin,
+                        ..
+                    })
+                ))
+                .count(),
+            1
+        );
+        recovery.update_siege(&w, TICK, &mut ev);
+        assert_eq!(recovery.population.count(Role::Peasant), 2);
     }
 
     #[test]
@@ -3428,7 +4192,9 @@ mod tests {
         let w = fight_world();
         let mut g = GameState::new(&w, 0, 4);
         g.monarch.x = -20.0;
-        let p = g.population.spawn(Role::Peasant, 4.0, &mut g.rng);
+        // Start in the hand box: this exercises capture/release independently
+        // of the scanner's randomized startup and five-second fallback wait.
+        let p = g.population.spawn(Role::Peasant, 6.0, &mut g.rng);
         g.greed
             .spawn_troll(crate::greed::EnemyKind::Squid, 6.0, 1, false, &mut g.rng);
         let ev = run_events(&mut g, &w, 10.0);
@@ -3442,17 +4208,17 @@ mod tests {
             .iter()
             .position(|t| t.kind == crate::greed::EnemyKind::Squid)
             .unwrap();
-        let mut ev = Vec::new();
-        g.greed.hurt(i, 30, &mut |e| ev.push(e));
-        let x = g.greed.trolls[i].x;
-        for e in ev {
-            if let GreedEvent::Released { count, .. } = e {
-                for _ in 0..count {
-                    g.population.spawn(Role::Peasant, x, &mut g.rng);
-                }
-            }
-        }
+        g.greed.trolls[i].hp = 1;
+        let ev = shoot_carrier(&mut g, &w, i, false);
         assert_eq!(g.population.count(Role::Peasant), 1);
+        assert_eq!(
+            ev.iter()
+                .filter(|e| matches!(e, GameEvent::Greed(GreedEvent::Released { count: 1, .. })))
+                .count(),
+            1
+        );
+        shoot_carrier(&mut g, &w, i, false);
+        assert_eq!(g.population.count(Role::Peasant), 1, "release only once");
     }
 
     #[test]
@@ -3604,6 +4370,7 @@ mod tests {
         g.look.queen = true;
         let bytes = crate::save::save_game(&g, 1);
         assert!(crate::save::load_game(&bytes, 1, &w).unwrap().look.queen);
+        let bytes = crate::save::legacy_game(&g, 1, 4);
         let look = postcard::to_allocvec(&g.look).unwrap().len();
         let tutorial = postcard::to_allocvec(&g.tutorial).unwrap().len();
         for cut in [look, look + tutorial] {
@@ -3665,5 +4432,924 @@ mod tests {
             crate::save::load_progress(&p[..p.len() - 1]).err(),
             Some(crate::save::LoadError::Corrupt)
         );
+    }
+
+    /// Hit a carrier through the production projectile collision and dispatch.
+    fn shoot_carrier(g: &mut GameState, w: &WorldData, i: usize, bolt: bool) -> Vec<GameEvent> {
+        let b = g.greed.trolls[i].box_at();
+        let (x, y) = (b.x + b.w * 0.5, b.y + b.h * 0.5);
+        if bolt {
+            g.greed.fire_bolt(x, y, 0.0, 0.0, 30, 1);
+        } else {
+            g.greed.shoot(x, y, 0.0, 0.0, false, false);
+        }
+        let mut ev = Vec::new();
+        g.update_greed(w, TICK, &mut ev);
+        ev
+    }
+
+    #[test]
+    fn stolen_coin_is_released_once_with_enemy_dropper_after_arrow_or_bolt() {
+        for bolt in [false, true] {
+            let w = fight_world();
+            let mut g = GameState::new(&w, 0, 41);
+            g.monarch.x = -20.0;
+            g.coins.drop(
+                Who::Monarch,
+                (8.0, 0.0),
+                (0.0, 0.0),
+                crate::coins::Policy::Anybody,
+                None,
+                None,
+            );
+            g.greed
+                .spawn_troll(crate::greed::EnemyKind::Troll, 8.0, 1, false, &mut g.rng);
+            g.update_greed(&w, TICK, &mut Vec::new());
+            assert!(g.coins.list.is_empty());
+            assert_eq!(g.greed.trolls[0].loot, Some(Loot::Coin));
+            let ev = shoot_carrier(&mut g, &w, 0, bolt);
+            assert!(ev
+                .iter()
+                .any(|e| matches!(e, GameEvent::Greed(GreedEvent::Killed(_)))));
+            assert_eq!(g.coins.list.len(), 1);
+            let coin = &g.coins.list[0];
+            assert_eq!(
+                coin.dropper,
+                Who::Thing,
+                "Droppable.Drop resets the player flag"
+            );
+            assert_eq!(coin.claimer, None, "old friendly claim is cleared");
+            assert_eq!(coin.policy, crate::coins::Policy::Anybody);
+            assert_eq!(g.greed.trolls[0].loot, None);
+            shoot_carrier(&mut g, &w, 0, bolt);
+            assert_eq!(g.coins.list.len(), 1, "dead carrier cannot release twice");
+        }
+    }
+
+    #[test]
+    fn stolen_tools_keep_identity_and_shields_keep_their_shop_on_recovery() {
+        for kind in [
+            ToolKind::Bow,
+            ToolKind::Hammer,
+            ToolKind::Scythe,
+            ToolKind::Shield,
+            ToolKind::Bread,
+        ] {
+            let w = fight_world();
+            let mut g = GameState::new(&w, 0, 42);
+            g.monarch.x = -20.0;
+            let mut shop = crate::units::ShieldShop::new(55, 8.0, 0.0, g.coat, 0.0, &mut g.rng);
+            shop.status = crate::units::ShieldStatus::Available;
+            g.population.shields.push(shop);
+            let owner = (kind == ToolKind::Shield).then_some(55);
+            g.population
+                .release_stolen_tool(kind, None, owner, 8.0, 0.0);
+            let id = g.population.tools[0].id;
+            g.greed
+                .spawn_troll(crate::greed::EnemyKind::Troll, 8.0, 1, false, &mut g.rng);
+            g.update_greed(&w, TICK, &mut Vec::new());
+            assert!(g.population.tools.is_empty());
+            assert_eq!(
+                g.greed.trolls[0].loot,
+                Some(Loot::CarriedTool {
+                    kind,
+                    id,
+                    shield_shop: owner
+                })
+            );
+            assert!(
+                !g.population.shields[0].can_pay(),
+                "carried shield still occupies shop"
+            );
+            shoot_carrier(&mut g, &w, 0, false);
+            assert_eq!(g.population.tools.len(), 1);
+            let t = &g.population.tools[0];
+            assert_eq!((t.id, t.kind, t.shop), (id, kind, owner));
+            assert_eq!(t.slot, u8::MAX);
+            shoot_carrier(&mut g, &w, 0, true);
+            assert_eq!(g.population.tools.len(), 1);
+        }
+    }
+
+    #[test]
+    fn escaped_carrier_returns_no_loot_and_frees_its_shield_shop() {
+        for kind in [None, Some(ToolKind::Shield)] {
+            let w = fight_world();
+            let mut g = GameState::new(&w, 0, 43);
+            g.monarch.x = -20.0;
+            let mut shop = crate::units::ShieldShop::new(55, 8.0, 0.0, g.coat, 0.0, &mut g.rng);
+            shop.status = crate::units::ShieldStatus::Available;
+            g.population.shields.push(shop);
+            g.greed
+                .spawn_troll(crate::greed::EnemyKind::Troll, 8.0, 1, false, &mut g.rng);
+            g.greed.trolls[0].loot = Some(match kind {
+                Some(kind) => Loot::CarriedTool {
+                    kind,
+                    id: 0,
+                    shield_shop: Some(55),
+                },
+                None => Loot::Coin,
+            });
+            g.greed.trolls[0].state = crate::greed::TrollState::Retreat { t: 10.0 };
+            let mut ev = Vec::new();
+            g.update_greed(&w, TICK, &mut ev);
+            assert!(g.greed.trolls.is_empty());
+            assert!(g.population.tools.is_empty());
+            assert!(g.coins.list.is_empty());
+            assert!(!ev
+                .iter()
+                .any(|e| matches!(e, GameEvent::Greed(GreedEvent::DroppedLoot { .. }))));
+            assert_eq!(g.population.shields[0].can_pay(), kind.is_some());
+        }
+    }
+
+    #[test]
+    fn bear_swipe_releases_captives_and_carried_loot_once() {
+        let mut w = fight_world();
+        w.steeds.push(crate::data::SteedDef {
+            attacks_while_running: true,
+            hit_box: (0.0, 0.0, 2.0, 2.0),
+            attack_damage: 30,
+            run_speed: 2.0,
+            forest_speed_multiplier: 1.0,
+            ..Default::default()
+        });
+        let mut g = GameState::new(&w, 0, 44);
+        g.monarch.x = 0.0;
+        g.greed
+            .spawn_troll(crate::greed::EnemyKind::Squid, 0.75, 1, false, &mut g.rng);
+        g.greed.trolls[0].victims = 2;
+        g.greed.trolls[0].loot = Some(Loot::Coin);
+        let mut ev = Vec::new();
+        g.tick(
+            &w,
+            &Controls {
+                direction: 1,
+                start_sprint: true,
+                ..Default::default()
+            },
+            &mut ev,
+        );
+        assert!(g.monarch.is_running());
+        assert_eq!(
+            g.population.count(Role::Peasant),
+            0,
+            "no swipe before the authored marker"
+        );
+        for _ in 0..15 {
+            g.tick(
+                &w,
+                &Controls {
+                    direction: 1,
+                    ..Default::default()
+                },
+                &mut ev,
+            );
+        }
+        assert_eq!(g.population.count(Role::Peasant), 2);
+        assert_eq!(
+            ev.iter()
+                .filter(|e| matches!(e, GameEvent::Greed(GreedEvent::DroppedLoot { .. })))
+                .count(),
+            1
+        );
+        run_events(&mut g, &w, 0.5);
+        assert_eq!(g.population.count(Role::Peasant), 2);
+    }
+
+    #[test]
+    fn knight_slash_releases_captives_and_carried_loot_once() {
+        let w = fight_world();
+        let mut g = GameState::new(&w, 0, 45);
+        g.monarch.x = -20.0;
+        g.population.spawn_knight(8.0, &mut g.rng);
+        g.greed
+            .spawn_troll(crate::greed::EnemyKind::Squid, 8.25, 1, false, &mut g.rng);
+        g.greed.trolls[0].hp = 1;
+        g.greed.trolls[0].victims = 2;
+        g.greed.trolls[0].loot = Some(Loot::Coin);
+        let ev = run_events(&mut g, &w, 0.5);
+        assert!(ev
+            .iter()
+            .any(|e| matches!(e, GameEvent::Unit(UnitEvent::Strike { .. }))));
+        assert_eq!(g.population.count(Role::Peasant), 2);
+        assert_eq!(
+            ev.iter()
+                .filter(|e| matches!(e, GameEvent::Greed(GreedEvent::DroppedLoot { .. })))
+                .count(),
+            1
+        );
+        run_events(&mut g, &w, 0.5);
+        assert_eq!(g.population.count(Role::Peasant), 2);
+    }
+
+    #[cfg(feature = "save")]
+    #[test]
+    fn carried_tool_save_roundtrip_preserves_identity_and_rejects_duplicate_ids() {
+        let mut w = fight_world();
+        w.steeds.push(Default::default());
+        let mut g = GameState::new(&w, 0, 46);
+        g.monarch.x = -20.0;
+        g.population
+            .release_stolen_tool(ToolKind::Bow, None, None, 8.0, 0.0);
+        let id = g.population.tools[0].id;
+        g.greed
+            .spawn_troll(crate::greed::EnemyKind::Troll, 8.0, 1, false, &mut g.rng);
+        g.update_greed(&w, TICK, &mut Vec::new());
+        let bytes = crate::save::save_game(&g, 123);
+        let mut loaded = crate::save::load_game(&bytes, 123, &w).unwrap();
+        assert_eq!(loaded.greed.trolls[0].loot, g.greed.trolls[0].loot);
+        shoot_carrier(&mut loaded, &w, 0, false);
+        assert_eq!(loaded.population.tools[0].id, id);
+        g.population
+            .release_stolen_tool(ToolKind::Bow, Some(id), None, 9.0, 0.0);
+        assert_eq!(
+            crate::save::load_game(&crate::save::save_game(&g, 123), 123, &w).err(),
+            Some(crate::save::LoadError::Corrupt)
+        );
+    }
+
+    #[cfg(feature = "save")]
+    #[test]
+    fn v5_carried_tool_loads_and_recovers_with_a_fresh_valid_identity() {
+        let mut w = fight_world();
+        w.steeds.push(Default::default());
+        let mut g = GameState::new(&w, 0, 47);
+        g.monarch.x = -20.0;
+        let citizen = g.population.spawn(Role::Worker, -10.0, &mut g.rng);
+        g.greed
+            .spawn_troll(crate::greed::EnemyKind::Troll, 8.0, 1, false, &mut g.rng);
+        g.greed.trolls[0].loot = Some(Loot::Tool(ToolKind::Hammer));
+        // v6 only appended a Loot variant; this legacy payload's bytes are
+        // unchanged from v5. Use its old header to exercise the v5 load path.
+        let bytes = crate::save::legacy_game(&g, 123, 5);
+        let mut loaded = crate::save::load_game(&bytes, 123, &w).unwrap();
+        shoot_carrier(&mut loaded, &w, 0, false);
+        let tool = &loaded.population.tools[0];
+        assert_eq!(tool.kind, ToolKind::Hammer);
+        assert_ne!(tool.id, citizen);
+        assert!(loaded.population.tool_id_allocated(tool.id));
+        assert!(crate::save::load_game(&crate::save::save_game(&loaded, 123), 123, &w).is_ok());
+    }
+
+    #[test]
+    fn tool_stolen_and_recovered_in_one_projectile_tick_is_not_lost() {
+        let w = fight_world();
+        let mut g = GameState::new(&w, 0, 48);
+        g.monarch.x = -20.0;
+        g.population
+            .release_stolen_tool(ToolKind::Bow, None, None, 8.0, 0.0);
+        let id = g.population.tools[0].id;
+        g.greed
+            .spawn_troll(crate::greed::EnemyKind::Troll, 8.0, 1, false, &mut g.rng);
+        let ev = shoot_carrier(&mut g, &w, 0, false);
+        assert!(ev
+            .iter()
+            .any(|e| matches!(e, GameEvent::Greed(GreedEvent::TookLoot { .. }))));
+        assert!(g.greed.trolls[0].is_dead());
+        assert_eq!(g.population.tools.len(), 1);
+        assert_eq!(g.population.tools[0].id, id);
+    }
+
+    #[test]
+    fn picking_up_the_crown_makes_its_carrier_invulnerable_in_the_same_tick() {
+        let w = fight_world();
+        let mut g = GameState::new(&w, 0, 49);
+        g.monarch.x = -20.0;
+        g.has_crown = false;
+        g.greed.drop_crown(8.0, 0.0, 0.0);
+        let crown = g.greed.crown.as_mut().unwrap();
+        crown.t = 2.0;
+        crown.y = 0.0;
+        g.greed
+            .spawn_troll(crate::greed::EnemyKind::Troll, 8.0, 1, false, &mut g.rng);
+        let ev = shoot_carrier(&mut g, &w, 0, true);
+        assert!(g.game_over);
+        assert_eq!(g.greed.trolls[0].loot, Some(Loot::Crown));
+        assert!(!g.greed.trolls[0].is_dead());
+        assert!(!ev
+            .iter()
+            .any(|e| matches!(e, GameEvent::Greed(GreedEvent::DroppedLoot { .. }))));
+        assert!(g.greed.crown.is_none());
+    }
+
+    #[test]
+    fn stolen_boat_part_stays_available_to_rebuy_after_carrier_dies() {
+        let mut w = fight_world();
+        let mut wharf = wall_proto("Wharf", 2, None, 0);
+        wharf.upgrade = None;
+        wharf.wharf = Some(crate::data::WharfDef {
+            work_per_part: 2,
+            parts: vec![(0, 0.0, 1.0)],
+            skeleton: None,
+            skeleton_at: (0.0, 0.0),
+            boat: None,
+        });
+        w.protos.push(wharf);
+        let mut g = GameState::new(&w, 0, 50);
+        g.monarch.x = -20.0;
+        g.level.add(level::instantiate(
+            &w,
+            1,
+            Layer::Game,
+            8.0,
+            build::WALK_Y,
+            0.1,
+            1.0,
+        ));
+        g.harbor = crate::boat::Harbor::new(&w, &mut g.level, 0, &mut g.rng);
+        g.harbor.pay_wharf(&w, &mut g.level, &mut g.rng);
+        let part = &mut g.harbor.wharf.as_mut().unwrap().stacked[0];
+        part.y = 0.0;
+        let x = part.x;
+        assert!(!g.harbor.wharf_can_pay());
+        g.greed
+            .spawn_troll(crate::greed::EnemyKind::Troll, x, 1, false, &mut g.rng);
+        g.update_greed(&w, TICK, &mut Vec::new());
+        assert_eq!(g.greed.trolls[0].loot, Some(Loot::BoatPart(0)));
+        assert!(
+            g.harbor.wharf_can_pay(),
+            "pickup already returned part to purchase pool"
+        );
+        let ev = shoot_carrier(&mut g, &w, 0, false);
+        assert!(g.harbor.wharf.as_ref().unwrap().stacked.is_empty());
+        assert!(g.harbor.wharf_can_pay());
+        assert!(!ev
+            .iter()
+            .any(|e| matches!(e, GameEvent::Greed(GreedEvent::DroppedLoot { .. }))));
+        g.harbor.pay_wharf(&w, &mut g.level, &mut g.rng);
+        assert_eq!(g.harbor.wharf.as_ref().unwrap().stacked.len(), 1);
+        assert!(
+            !g.harbor.wharf_can_pay(),
+            "death must not duplicate purchase stock"
+        );
+    }
+    fn marker_clip(
+        length: f32,
+        looping: bool,
+        markers: &[(f32, EventKind)],
+    ) -> crate::animation::Clip {
+        crate::animation::Clip {
+            length,
+            looping,
+            events: markers
+                .iter()
+                .map(|&(time, kind)| crate::animation::Event {
+                    time,
+                    kind,
+                    float_parameter: 0.0,
+                    int_parameter: 0,
+                    string_parameter: Default::default(),
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    fn squid_citizen_fixture() -> (WorldData, GameState) {
+        let w = fight_world();
+        let mut g = GameState::new(&w, 0, 81);
+        g.population = Default::default();
+        g.greed = Default::default();
+        g.monarch.x = 100.0;
+        g.campfire = 100.0;
+        g.greed
+            .spawn_troll(crate::greed::EnemyKind::Squid, 8.0, 1, false, &mut g.rng);
+        (w, g)
+    }
+
+    fn boss_throw_fixture(side: i8) -> (WorldData, GameState) {
+        use crate::animation::{Key, Tangent, TransformTrack};
+        let mut w = fight_world();
+        w.steeds.push(Default::default());
+        let mut clip = marker_clip(2.0, false, &[(0.8333333, EventKind::BoulderRelease)]);
+        let mut hand = TransformTrack {
+            path: "Hand".into(),
+            ..Default::default()
+        };
+        for (axis, at) in [0.4, 0.125].into_iter().enumerate() {
+            hand.position[axis] = [(0.0, at), (0.8333333, [0.963, 0.876][axis]), (1.0, 1.5)]
+                .into_iter()
+                .map(|(time, value)| Key {
+                    time,
+                    value,
+                    in_tangent: Tangent::Step,
+                    out_tangent: Tangent::Step,
+                })
+                .collect();
+        }
+        clip.tracks.push(hand);
+        w.animations.clips.push(("boss_throw".into(), clip));
+        let mut g = GameState::new(&w, 0, 23);
+        g.campfire = 0.0;
+        g.monarch.x = 100.0;
+        g.has_crown = false;
+        let kind = if side > 0 {
+            crate::greed::EnemyKind::Boss
+        } else {
+            crate::greed::EnemyKind::KillerBoss
+        };
+        g.greed.spawn_troll(kind, 0.0, 1, true, &mut g.rng);
+        g.greed.trolls[0].mover.facing = side;
+        g.siege.boulders.push(crate::siege::Boulder::test_lodged(
+            f32::from(side) * w.boss_throw.hand[0],
+        ));
+        for _ in 0..15 {
+            g.update_greed(&w, TICK, &mut Vec::new());
+            if g.siege.boulders[0].runtime.held_by.is_some() {
+                break;
+            }
+        }
+        assert_eq!(
+            g.siege.boulders[0].runtime.held_by,
+            Some(g.greed.trolls[0].id)
+        );
+        (w, g)
+    }
+
+    #[test]
+    fn boss_relaunches_same_boulder_from_mirrored_marker_and_resumes_saved_flight() {
+        for side in [-1, 1] {
+            let (w, mut g) = boss_throw_fixture(side);
+            let mut events = Vec::new();
+            let id = g.siege.boulders[0].runtime.id;
+            g.update_greed(&w, 0.7, &mut events);
+            assert!(!g.siege.boulders[0].runtime.hostile);
+            #[cfg(feature = "save")]
+            {
+                let save = crate::save::save_game(&g, 1);
+                g = crate::save::load_game(&save, 1, &w).unwrap();
+                assert_eq!(crate::save::save_game(&g, 1), save);
+            }
+            assert!(events.is_empty());
+            g.update_greed(&w, 0.14, &mut events);
+            let b = &g.siege.boulders[0];
+            assert_eq!(b.runtime.id, id);
+            assert_eq!(b.runtime.held_by, None);
+            assert!(b.runtime.hostile);
+            assert_eq!(b.x, f32::from(side) * 0.963);
+            assert_eq!(b.y, 0.876);
+            assert!((4.0..=7.0).contains(&b.vy));
+            assert_eq!(b.vx, f32::from(side) * b.vy);
+            assert_eq!(
+                events,
+                [GameEvent::Greed(GreedEvent::BoulderThrown { x: 0.0 })]
+            );
+            #[cfg(feature = "save")]
+            let mut resumed =
+                crate::save::load_game(&crate::save::save_game(&g, 1), 1, &w).unwrap();
+            events.clear();
+            g.update_greed(&w, 1.5, &mut events);
+            assert!(g.siege.boulders.is_empty());
+            assert!(matches!(
+                events.as_slice(),
+                [
+                    GameEvent::BoulderImpact { .. },
+                    GameEvent::BoulderFragments { .. },
+                    GameEvent::BoulderBurst { impact: true, .. }
+                ]
+            ));
+            #[cfg(feature = "save")]
+            {
+                let mut resumed_events = Vec::new();
+                resumed.update_greed(&w, 1.5, &mut resumed_events);
+                assert_eq!(events, resumed_events);
+                assert_eq!(
+                    crate::save::save_game(&g, 1),
+                    crate::save::save_game(&resumed, 1)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn boss_death_cancels_release_and_removes_held_stone_with_corpse() {
+        let (w, mut g) = boss_throw_fixture(1);
+        let owner = g.greed.trolls[0].id;
+        g.update_greed(&w, 0.7, &mut Vec::new());
+        g.greed.hurt(0, 1000, &mut |_| {});
+        #[cfg(feature = "save")]
+        {
+            g = crate::save::load_game(&crate::save::save_game(&g, 1), 1, &w).unwrap();
+        }
+        let mut events = Vec::new();
+        g.update_greed(&w, 1.0, &mut events);
+        let b = &g.siege.boulders[0];
+        assert_eq!(b.runtime.held_by, Some(owner));
+        assert!(!b.runtime.hostile);
+        assert_eq!([b.x, b.y], g.greed.trolls[0].boss_hand(&w));
+        assert!(events.is_empty());
+        g.update_greed(&w, 9.0, &mut events);
+        assert!(g.greed.trolls.is_empty() && g.siege.boulders.is_empty());
+        assert!(events.is_empty());
+    }
+
+    #[cfg(feature = "save")]
+    #[test]
+    fn save_rejects_missing_duplicate_and_orphaned_held_boulders() {
+        let (w, g) = boss_throw_fixture(1);
+        for mutation in 0..3 {
+            let mut invalid = g.clone();
+            match mutation {
+                0 => invalid.siege.boulders.clear(),
+                1 => invalid.siege.boulders.push(g.siege.boulders[0].clone()),
+                _ => invalid.siege.boulders[0].runtime.held_by = Some(99),
+            }
+            let bytes = crate::save::save_game(&invalid, 1);
+            assert_eq!(
+                crate::save::load_game(&bytes, 1, &w).err(),
+                Some(crate::save::LoadError::Corrupt)
+            );
+        }
+    }
+
+    #[test]
+    fn returned_boulder_shakes_at_the_player_even_when_the_passenger_absorbs_damage() {
+        for (has_passenger, has_crown) in [(false, true), (true, true), (false, false)] {
+            let w = fight_world();
+            let mut g = GameState::new(&w, 0, 3);
+            g.monarch.x = 1.8;
+            g.wallet.set(20);
+            g.has_crown = has_crown;
+            g.passenger = has_passenger.then_some(100);
+            let citizen = g.population.spawn(Role::Archer, 2.0, &mut g.rng);
+            let mut b = crate::siege::Boulder::test_lodged(0.0);
+            assert!(b.hold_by(99));
+            b.release_from_boss([0.0, 0.125], 1, 4.0, 0.0, &w, &mut g.rng);
+            g.siege.boulders.push(b);
+            let mut events = Vec::new();
+            g.update_greed(&w, TICK, &mut events);
+            g.update_greed(&w, 0.6, &mut events);
+            assert_eq!(
+                g.wallet.coins(),
+                if has_passenger || !has_crown { 20 } else { 5 }
+            );
+            assert!(g.passenger.is_none());
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|e| matches!(e,
+                GameEvent::CameraShake { x, y } if *x == g.monarch.x && *y == g.monarch_y))
+                    .count(),
+                usize::from(has_crown)
+            );
+            assert!(events.iter().any(|e| matches!(e,
+                GameEvent::Unit(UnitEvent::Promoted { unit, role: Role::Peasant }) if *unit == citizen)));
+            assert!(events
+                .iter()
+                .any(|e| matches!(e, GameEvent::BoulderBurst { impact: true, .. })));
+        }
+    }
+
+    #[test]
+    fn squid_obstacle_snapshot_uses_actual_mirrored_collider_paths_and_build_activation() {
+        let (mut w, mut g) = squid_citizen_fixture();
+        w.protos.push(crate::data::Proto {
+            obstacles: alloc::vec![crate::data::ObstacleDef {
+                origin: [0.5, 0.3],
+                points: alloc::vec![[-1., 0.], [2., 0.], [1., 3.]],
+            }],
+            building: Some(crate::data::BuildingDef {
+                build_points: 10,
+                auto_build_rate: 0.,
+                scaffold: alloc::vec![],
+            }),
+            ..Default::default()
+        });
+        g.level = Level::empty(-20., 40.);
+        let proto = (w.protos.len() - 1) as u16;
+        let mut wall = level::instantiate(&w, proto, crate::data::Layer::Game, 4., 1., 0., -1.);
+        wall.build = Some(9.);
+        let id = g.level.add(wall);
+        assert!(g.squid_obstacles(&w).0.is_empty());
+        g.level.objects[0].build = Some(10.);
+        let (scan, solid) = g.squid_obstacles(&w);
+        assert_eq!(scan.len(), 1);
+        assert_eq!(scan[0].object, id);
+        assert_eq!(scan[0].x, 3.5);
+        assert_eq!(
+            solid[0].points,
+            alloc::vec![[5., 0.125], [2., 0.125], [3., 3.125]]
+        );
+        assert_eq!(
+            (
+                scan[0].rect.x,
+                scan[0].rect.y,
+                scan[0].rect.w,
+                scan[0].rect.h
+            ),
+            (2., 0.125, 3., 3.)
+        );
+        // A damageable with no layer-20 collider must not become a flight obstacle.
+        w.protos[proto as usize].obstacles.clear();
+        assert!(g.squid_obstacles(&w).0.is_empty());
+    }
+
+    #[test]
+    fn squid_grabs_tower_archers_and_stunned_citizens_through_independent_snapshot() {
+        for (role, height, stunned) in [(Role::Archer, 2.0, 0.0), (Role::Peasant, 0.0, 4.0)] {
+            let (w, mut g) = squid_citizen_fixture();
+            let id = g.population.spawn(role, 8.0, &mut g.rng);
+            let u = g.population.units.iter_mut().find(|u| u.id == id).unwrap();
+            u.y = height;
+            u.in_slot = role == Role::Archer;
+            u.stunned = stunned;
+            g.greed.trolls[0].y = height;
+            let mut events = Vec::new();
+            g.update_greed(&w, 0.0, &mut events);
+            assert!(
+                g.population.units.is_empty(),
+                "{role:?} at height {height} must remain squid prey"
+            );
+            assert_eq!(g.greed.trolls[0].victims, 1);
+            assert_eq!(events.iter().filter(|e| matches!(e, GameEvent::Greed(GreedEvent::Grabbed { unit, .. }) if *unit == id)).count(), 1);
+        }
+    }
+
+    #[test]
+    fn squid_checks_single_overlap_and_closest_citizen_before_grabbability() {
+        let (w, mut g) = squid_citizen_fixture();
+        let knight = g.population.spawn(Role::Knight, 8.0, &mut g.rng);
+        let peasant = g.population.spawn(Role::Peasant, 8.0, &mut g.rng);
+        g.population
+            .units
+            .iter_mut()
+            .find(|u| u.id == knight)
+            .unwrap()
+            .z = 0.0;
+        g.population
+            .units
+            .iter_mut()
+            .find(|u| u.id == peasant)
+            .unwrap()
+            .z = 1.0;
+        g.update_greed(&w, 0.0, &mut Vec::new());
+        assert_eq!(g.population.units.len(), 2);
+        assert_eq!(g.greed.trolls[0].victims, 0);
+        assert!(
+            g.greed.trolls[0].grab_animation_time().is_none(),
+            "rejected collider cannot start a grab"
+        );
+        // Unity OverlapArea picks the lowest-Z collider, then checks CanBeGrabbedNow.
+        g.population
+            .units
+            .iter_mut()
+            .find(|u| u.id == peasant)
+            .unwrap()
+            .z = -1.0;
+        g.update_greed(&w, 0.0, &mut Vec::new());
+        assert_eq!(g.population.units.len(), 1);
+        assert_eq!(g.population.units[0].id, knight);
+        assert_eq!(g.greed.trolls[0].victims, 1);
+
+        let (_, mut g) = squid_citizen_fixture();
+        g.population.spawn(Role::Knight, 8.5, &mut g.rng);
+        g.population.spawn(Role::Peasant, 11.0, &mut g.rng);
+        g.greed.trolls[0].y = 2.0;
+        g.update_greed(&w, 0.5, &mut Vec::new());
+        assert_eq!(
+            g.greed.trolls[0].mover.goal.unwrap().0,
+            g.campfire,
+            "a non-grabbable closest citizen must not be skipped for a farther citizen"
+        );
+    }
+
+    #[test]
+    fn squid_chases_actual_citizen_height_and_two_squids_cannot_share_one_capture() {
+        let (w, mut g) = squid_citizen_fixture();
+        g.population.spawn(Role::Archer, 11.0, &mut g.rng);
+        g.population.units[0].y = 2.0;
+        g.population.units[0].in_slot = true;
+        g.greed.trolls[0].y = 2.5;
+        // Let the scanner's randomized initial 0..0.5s phase elapse before
+        // checking the held altitude selected by the Chase coroutine.
+        g.update_greed(&w, 0.5, &mut Vec::new());
+        g.greed.trolls[0].y = 2.5;
+        g.update_greed(&w, 0.1, &mut Vec::new());
+        assert_eq!(
+            g.greed.squid_states()[0].altitude,
+            2.0,
+            "swoop goal is the citizen root height, not the ground"
+        );
+        assert!(
+            (g.greed.trolls[0].y - 2.4).abs() > 1e-4,
+            "altitude is reached through physical flight, not a fixed easing step"
+        );
+        assert_eq!(g.greed.trolls[0].mover.goal.unwrap().0, 11.0);
+
+        let (_, mut g) = squid_citizen_fixture();
+        g.population.spawn(Role::Peasant, 8.0, &mut g.rng);
+        g.greed
+            .spawn_troll(crate::greed::EnemyKind::Squid, 8.0, 1, false, &mut g.rng);
+        let mut events = Vec::new();
+        g.update_greed(&w, 0.0, &mut events);
+        assert!(g.population.units.is_empty());
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, GameEvent::Greed(GreedEvent::Grabbed { .. })))
+                .count(),
+            1
+        );
+        assert_eq!(
+            g.greed
+                .trolls
+                .iter()
+                .filter(|t| t.grab_animation_time().is_some())
+                .count(),
+            1
+        );
+        assert_eq!(
+            g.greed.trolls.iter().map(|t| t.victims as u32).sum::<u32>(),
+            1
+        );
+    }
+
+    fn bear_marker_fixture() -> (WorldData, GameState) {
+        let mut w = fight_world();
+        w.steeds.push(crate::data::SteedDef {
+            clips: "player_bear".into(),
+            attacks_while_running: true,
+            hit_box: (0.0, 0.0, 2.0, 2.0),
+            attack_damage: 1,
+            run_speed: 2.0,
+            forest_speed_multiplier: 1.0,
+            ..Default::default()
+        });
+        w.animations.clips.push((
+            "player_bear_gallop".into(),
+            marker_clip(0.8, true, &[(0.3, EventKind::TriggerAbility)]),
+        ));
+        w.animations.states.push(crate::animation::AnimatorState {
+            controller: "player_king".into(),
+            name: "Run".into(),
+            clip: None,
+            speed: 2.0,
+            speed_parameter: None,
+            cycle_offset: 0.0,
+        });
+        let mut g = GameState::new(&w, 0, 71);
+        g.tick(
+            &w,
+            &Controls {
+                direction: 1,
+                start_sprint: true,
+                ..Default::default()
+            },
+            &mut Vec::new(),
+        );
+        assert!(g.monarch.is_running());
+        // Fixture starts at the action entry; subsequent advancement uses the
+        // production mount update, including collisions and recovery effects.
+        g.steed_attack = 0.0;
+        g.greed.spawn_troll(
+            crate::greed::EnemyKind::Troll,
+            g.monarch.x + 0.5,
+            0,
+            false,
+            &mut g.rng,
+        );
+        g.greed.trolls[0].hp = 100;
+        (w, g)
+    }
+
+    #[test]
+    fn bear_swipes_use_authored_marker_speed_and_multi_loop_crossings() {
+        let (w, mut g) = bear_marker_fixture();
+        let mut ev = Vec::new();
+        g.update_steeds(&w, 0.14, &mut ev);
+        assert_eq!(g.greed.trolls[0].hp, 100);
+        g.update_steeds(&w, 0.02, &mut ev);
+        assert_eq!(g.greed.trolls[0].hp, 99, "0.3 clip seconds at 2x speed");
+        let (_, mut one_batch) = bear_marker_fixture();
+        let mut split = one_batch.clone();
+        one_batch.update_steeds(&w, 1.25, &mut Vec::new());
+        for _ in 0..125 {
+            split.update_steeds(&w, 0.01, &mut Vec::new());
+        }
+        assert_eq!(one_batch.greed.trolls[0].hp, 97);
+        assert_eq!(split.greed.trolls[0].hp, one_batch.greed.trolls[0].hp);
+        // Leaving gallop discards its pending marker; re-entry starts a new clip.
+        g.tick(&w, &Controls::default(), &mut Vec::new());
+        assert_eq!(g.steed_animation_time(), 0.0);
+        g.tick(
+            &w,
+            &Controls {
+                direction: 1,
+                start_sprint: true,
+                ..Default::default()
+            },
+            &mut Vec::new(),
+        );
+        let hp = g.greed.trolls[0].hp;
+        g.update_steeds(&w, 0.10, &mut Vec::new());
+        assert_eq!(g.greed.trolls[0].hp, hp);
+        g.update_steeds(&w, 0.05, &mut Vec::new());
+        assert_eq!(g.greed.trolls[0].hp, hp - 1);
+    }
+
+    #[cfg(feature = "save")]
+    #[test]
+    fn saved_bear_marker_phase_resumes_without_replaying_and_v6_migrates_countdown() {
+        let (w, mut g) = bear_marker_fixture();
+        g.update_steeds(&w, 0.14, &mut Vec::new());
+        let bytes = crate::save::save_game(&g, 91);
+        let legacy = crate::save::legacy_game(&g, 91, 6);
+        let mut resumed = crate::save::load_game(&bytes, 91, &w).unwrap();
+        for dt in [0.02, 0.03, 0.50] {
+            g.update_steeds(&w, dt, &mut Vec::new());
+            resumed.update_steeds(&w, dt, &mut Vec::new());
+        }
+        assert_eq!(
+            crate::save::save_game(&g, 91),
+            crate::save::save_game(&resumed, 91)
+        );
+        let migrated = crate::save::load_game(&legacy, 91, &w).unwrap();
+        assert_eq!(migrated.steed_animation_time(), 0.0);
+        assert_eq!(migrated.greed.trolls[0].hp, 100);
+    }
+
+    #[cfg(feature = "save")]
+    #[test]
+    fn squid_grab_lock_uses_completion_marker_and_survives_resume() {
+        let mut w = fight_world();
+        w.steeds.push(Default::default());
+        w.animations.clips.push((
+            "squid_attack".into(),
+            marker_clip(0.75, true, &[(0.5, EventKind::GrabComplete)]),
+        ));
+        let mut g = GameState::new(&w, 0, 72);
+        g.monarch.x = -20.0;
+        g.population.spawn(Role::Peasant, 8.0, &mut g.rng);
+        g.population.spawn(Role::Peasant, 8.1, &mut g.rng);
+        g.greed
+            .spawn_troll(crate::greed::EnemyKind::Squid, 8.0, 1, false, &mut g.rng);
+        let mut ev = Vec::new();
+        g.update_greed(&w, TICK, &mut ev);
+        assert_eq!(g.greed.trolls[0].victims, 1, "capture is immediate");
+        for _ in 0..26 {
+            g.update_greed(&w, TICK, &mut ev);
+        }
+        assert_eq!(
+            g.greed.trolls[0].victims, 1,
+            "cannot capture again during hand animation"
+        );
+        assert!(!ev
+            .iter()
+            .any(|e| matches!(e, GameEvent::Greed(GreedEvent::GrabComplete(_)))));
+        let mut resumed = crate::save::load_game(&crate::save::save_game(&g, 92), 92, &w).unwrap();
+        let mut a = Vec::new();
+        let mut b = Vec::new();
+        for _ in 0..7 {
+            g.update_greed(&w, TICK, &mut a);
+            resumed.update_greed(&w, TICK, &mut b);
+        }
+        assert_eq!(
+            g.greed.trolls[0].victims, 1,
+            "completion still has a 0.1s settle"
+        );
+        assert_eq!(
+            a.iter()
+                .filter(|e| matches!(e, GameEvent::Greed(GreedEvent::GrabComplete(_))))
+                .count(),
+            1
+        );
+        // A catch-up update after the marker must not replay the next loop's
+        // marker while finishing the already pending settle coroutine.
+        let mut catchup = g.clone();
+        let mut catchup_events = Vec::new();
+        catchup.update_greed(&w, 1.25, &mut catchup_events);
+        assert!(!catchup_events
+            .iter()
+            .any(|e| matches!(e, GameEvent::Greed(GreedEvent::GrabComplete(_)))));
+        for _ in 0..7 {
+            // Keep the second citizen in reach to test the animation lock,
+            // independently of the held flight/goal during Chase's wait.
+            for game in [&mut g, &mut resumed] {
+                game.greed.trolls[0].x = 8.1;
+                game.greed.trolls[0].y = 0.0;
+            }
+            g.update_greed(&w, TICK, &mut a);
+            resumed.update_greed(&w, TICK, &mut b);
+        }
+        assert_eq!(g.greed.trolls[0].victims, 2);
+        assert_eq!(a, b);
+        assert_eq!(
+            crate::save::save_game(&g, 92),
+            crate::save::save_game(&resumed, 92)
+        );
+        // Death interrupts the pending second grab; no completion arrives later.
+        g.greed.trolls[0].y = 2.0;
+        let killed = shoot_carrier(&mut g, &w, 0, true);
+        assert!(killed
+            .iter()
+            .any(|e| matches!(e, GameEvent::Greed(GreedEvent::Killed(_)))));
+        let mut after = Vec::new();
+        for _ in 0..60 {
+            g.update_greed(&w, TICK, &mut after);
+        }
+        assert!(!after
+            .iter()
+            .any(|e| matches!(e, GameEvent::Greed(GreedEvent::GrabComplete(_)))));
     }
 }

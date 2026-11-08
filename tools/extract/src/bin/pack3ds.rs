@@ -15,6 +15,7 @@
 //!
 //! `cargo run --release -p extract --bin pack3ds -- assets crates/n3ds/romfs`
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -31,6 +32,55 @@ struct Img {
     w: u32,
     h: u32,
     px: Vec<u8>,
+}
+
+fn split_recolor(base: &mut Img, cloud: bool) -> [Option<Img>; 2] {
+    // Cloud alpha is shader coverage, even when it equals a recolour key.
+    if cloud {
+        return [None, None];
+    }
+    [KEY_A, KEY_B].map(|key| {
+        let mut mask = Img {
+            w: base.w,
+            h: base.h,
+            px: vec![0; base.px.len()],
+        };
+        let mut any = false;
+        for (pixel, out) in base
+            .px
+            .as_chunks_mut::<4>()
+            .0
+            .iter_mut()
+            .zip(mask.px.as_chunks_mut::<4>().0.iter_mut())
+        {
+            if pixel[3] == key {
+                let shade = pixel[0];
+                *out = [shade, shade, shade, 255];
+                pixel[3] = 0;
+                any = true;
+            }
+        }
+        any.then_some(mask)
+    })
+}
+
+#[cfg(test)]
+#[test]
+fn cloud_coverage_at_recolour_keys_survives_3ds_mask_split() {
+    let pixels = [17, 28, 32, KEY_A, 33, 29, 23, KEY_B];
+    let mut base = Img {
+        w: 2,
+        h: 1,
+        px: pixels.to_vec(),
+    };
+    assert!(split_recolor(&mut base, true)
+        .into_iter()
+        .all(|m| m.is_none()));
+    assert_eq!(base.px, pixels);
+    let [a, b] = split_recolor(&mut base, false);
+    assert_eq!(a.unwrap().px, [17, 17, 17, 255, 0, 0, 0, 0]);
+    assert_eq!(b.unwrap().px, [0, 0, 0, 0, 33, 33, 33, 255]);
+    assert_eq!(base.px, [17, 28, 32, 0, 33, 29, 23, 0]);
 }
 
 fn load_png(path: &Path) -> Result<Img, String> {
@@ -122,6 +172,10 @@ fn main() {
 }
 
 fn run(src: &Path, out: &Path) -> Result<(), String> {
+    let world_bytes =
+        std::fs::read(src.join("world.bin")).map_err(|e| format!("world.bin: {e}"))?;
+    let world =
+        game::assetfile::decode_world(&world_bytes).map_err(|e| format!("world.bin: {e}"))?;
     let read = |n: &str| {
         std::fs::read_to_string(src.join(n)).map_err(|e| format!("{}: {e}", src.join(n).display()))
     };
@@ -130,6 +184,17 @@ fn run(src: &Path, out: &Path) -> Result<(), String> {
         &read("clips.json")?,
         &read("font.json")?,
     )?;
+    let cloud_sprites: HashSet<_> = world
+        .clouds
+        .iter()
+        .flat_map(game::data::CloudsDef::sprite_ids)
+        .map(|id| {
+            let name = &world.sprites[usize::from(id)];
+            sheet
+                .id(name)
+                .ok_or_else(|| format!("missing cloud sprite {name}"))
+        })
+        .collect::<Result<_, _>>()?;
     let pages: Vec<Img> = sheet
         .pages
         .iter()
@@ -159,33 +224,8 @@ fn run(src: &Path, out: &Path) -> Result<(), String> {
             base
         };
         let s = *s;
-        let (w, h) = (base.w, base.h);
-        let mut split = |key: u8| -> Option<Img> {
-            let mut m = Img {
-                w,
-                h,
-                px: vec![0; base.px.len()],
-            };
-            let mut any = false;
-            for (b, o) in base
-                .px
-                .as_chunks_mut::<4>()
-                .0
-                .iter_mut()
-                .zip(m.px.as_chunks_mut::<4>().0.iter_mut())
-            {
-                if b[3] == key {
-                    // The red channel is the shade the recolour tints.
-                    o.copy_from_slice(&[b[0], b[0], b[0], 255]);
-                    b[3] = 0;
-                    any = true;
-                }
-            }
-            any.then_some(m)
-        };
-        let a = split(KEY_A);
-        let b = split(KEY_B);
-        for (k, m) in [a, b].into_iter().enumerate() {
+        let cloud = cloud_sprites.contains(&(i as u32));
+        for (k, m) in split_recolor(&mut base, cloud).into_iter().enumerate() {
             let Some(m) = m else { continue };
             let id = out_sheet.sprites.len();
             out_sheet.sprites.push(Sprite {
@@ -204,12 +244,13 @@ fn run(src: &Path, out: &Path) -> Result<(), String> {
             });
             masks += 1;
         }
-        let soft = base
-            .px
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .any(|p| p[3] != 0 && p[3] != 255);
+        let soft = cloud
+            || base
+                .px
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .any(|p| p[3] != 0 && p[3] != 255);
         pieces.push(Piece {
             sprite: i,
             img: base,
@@ -379,10 +420,10 @@ fn run(src: &Path, out: &Path) -> Result<(), String> {
             });
         }
     }
-    let bin = postcard::to_allocvec(&out_sheet).map_err(|e| e.to_string())?;
+    let bin = game::assetfile::encode(game::assetfile::Kind::Sheet, &out_sheet)
+        .map_err(|e| e.to_string())?;
     std::fs::write(out.join("sheet.bin"), bin).map_err(|e| e.to_string())?;
-    std::fs::copy(src.join("world.bin"), out.join("world.bin"))
-        .map_err(|e| format!("world.bin: {e}"))?;
+    std::fs::write(out.join("world.bin"), &world_bytes).map_err(|e| format!("world.bin: {e}"))?;
     let sd = out
         .parent()
         .unwrap_or(Path::new("."))

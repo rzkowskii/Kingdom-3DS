@@ -8,7 +8,7 @@ use game::rng::Rng;
 fn main() {
     let path = std::env::args().nth(1).expect("world.bin path");
     let world: WorldData =
-        postcard::from_bytes(&std::fs::read(path).expect("read")).expect("decode");
+        game::assetfile::decode_world(&std::fs::read(path).expect("read")).expect("decode");
     let mut coins: u32 = std::env::args()
         .nth(2)
         .and_then(|s| s.parse().ok())

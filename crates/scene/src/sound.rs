@@ -80,27 +80,40 @@ fn proto_name<'w>(w: &'w WorldData, g: &GameState, id: u32) -> &'w str {
 }
 
 /// The cues one game event makes.
-pub fn on_event(w: &WorldData, g: &GameState, e: &GameEvent, cues: &mut Vec<Cue>, music: &mut Vec<MusicCue>) {
+pub fn on_event(
+    w: &WorldData,
+    g: &GameState,
+    e: &GameEvent,
+    cues: &mut Vec<Cue>,
+    music: &mut Vec<MusicCue>,
+) {
     let monarch = Some(g.monarch.x);
     let mut cue = |sound: Option<SoundId>, x: Option<f32>| {
         if let Some(sound) = sound {
-            cues.push(Cue { sound, x, clip: None });
+            cues.push(Cue {
+                sound,
+                x,
+                clip: None,
+            });
         }
     };
     let steed = &w.steeds[g.steed as usize].name;
     match *e {
         GameEvent::Music(t) => music.push(MusicCue::Queue(t)),
-        GameEvent::Day(game::time::DayEvent::Started { show_counter: true, .. }) => {
-            cue(w.audio.sound("InterfaceOverlay.daysAppearSound"), None)
-        }
+        GameEvent::Day(game::time::DayEvent::Started {
+            show_counter: true, ..
+        }) => cue(w.audio.sound("InterfaceOverlay.daysAppearSound"), None),
         GameEvent::Monarch(m) => match m {
             MonarchEvent::Reared => cue(on(w, steed, "Steed.rearSound"), monarch),
             MonarchEvent::BecameTired => cue(on(w, steed, "Steed.puffSound"), monarch),
             _ => {}
         },
         GameEvent::Coin(c) => match c {
+            CoinEvent::HitGroundAt { x } => cue(w.audio.sound("Coin.hitGroundSound"), Some(x)),
             CoinEvent::HitGround => cue(w.audio.sound("Coin.hitGroundSound"), monarch),
-            CoinEvent::PickedUp(Who::Unit(u)) => cue(w.audio.sound("Wallet.pickupSound"), unit_x(g, u)),
+            CoinEvent::PickedUp(Who::Unit(u)) => {
+                cue(w.audio.sound("Wallet.pickupSound"), unit_x(g, u))
+            }
             CoinEvent::PickedUp(_) => {}
         },
         GameEvent::Pay(p) => match p {
@@ -150,7 +163,14 @@ pub fn on_event(w: &WorldData, g: &GameState, e: &GameEvent, cues: &mut Vec<Cue>
         }
         GameEvent::Built(id) => {
             let x = object(g, id).map(|o| o.x);
-            cue(on(w, proto_name(w, g, id), "WorkableBuilding.buildingCompleteSound"), x);
+            cue(
+                on(
+                    w,
+                    proto_name(w, g, id),
+                    "WorkableBuilding.buildingCompleteSound",
+                ),
+                x,
+            );
         }
         GameEvent::Unit(u) => match u {
             UnitEvent::Promoted { unit, role } => {
@@ -165,12 +185,20 @@ pub fn on_event(w: &WorldData, g: &GameState, e: &GameEvent, cues: &mut Vec<Cue>
                 cue(on(w, owner, "Character.spawnSound"), unit_x(g, unit));
             }
             UnitEvent::WorkSound { x, tree } => cue(
-                w.audio.sound(if tree { "WorkableTree.chopSound" } else { "Worker.buildingSound" }),
+                w.audio.sound(if tree {
+                    "WorkableTree.chopSound"
+                } else {
+                    "Worker.buildingSound"
+                }),
                 Some(x),
             ),
-            UnitEvent::PaidTaxes(unit) => cue(w.audio.sound("Wallet.payTaxesSound"), unit_x(g, unit)),
+            UnitEvent::PaidTaxes(unit) => {
+                cue(w.audio.sound("Wallet.payTaxesSound"), unit_x(g, unit))
+            }
             UnitEvent::Farmed(unit) => cue(w.audio.sound("Farmer.farmSound"), unit_x(g, unit)),
-            UnitEvent::Strike { from_x, .. } => cue(w.audio.sound("Knight.slashSound"), Some(from_x)),
+            UnitEvent::Strike { from_x, .. } => {
+                cue(w.audio.sound("Knight.slashSound"), Some(from_x))
+            }
             UnitEvent::Arrow { x, .. } => cue(w.audio.sound("Archer.shootSound"), Some(x)),
             UnitEvent::Wound(id) => {
                 let name = proto_name(w, g, id);
@@ -183,24 +211,43 @@ pub fn on_event(w: &WorldData, g: &GameState, e: &GameEvent, cues: &mut Vec<Cue>
             }
             _ => {}
         },
+        GameEvent::Siege(game::siege::CatapultEvent::Fired { x, .. }) => {
+            cue(w.audio.sound("Catapult.fireSound"), Some(x));
+        }
         GameEvent::Greed(e) => match e {
+            GreedEvent::BoulderThrown { x } => cue(w.audio.sound("Boss.throwSound"), Some(x)),
             GreedEvent::Charge(t) => cue(w.audio.sound("Troll.chargeSound"), troll_x(g, t)),
-            GreedEvent::PortalOpened(id) => {
-                cue(w.audio.sound("EnemyManager.enemiesSpawnedSound"), object(g, id).map(|o| o.x))
+            GreedEvent::BossWaveSpawned { .. } => {
+                cue(w.audio.sound("EnemyManager.enemiesSpawnedSound"), None);
             }
             GreedEvent::Hit { by, target, .. } => match target {
-                Target::Object(o) => cue(w.audio.sound("Damageable.hitSound"), object(g, o).map(|o| o.x)),
+                Target::Object(o) => cue(
+                    w.audio.sound("Damageable.hitSound"),
+                    object(g, o).map(|o| o.x),
+                ),
                 _ => cue(w.audio.sound("Damageable.hitSound"), troll_x(g, by)),
             },
-            GreedEvent::TookLoot { by, .. } => cue(w.audio.sound("Troll.coinPickupSound"), troll_x(g, by)),
-            GreedEvent::PortalHit { object: o, .. } => {
-                cue(w.audio.sound("Portal.provokedSound"), object(g, o).map(|o| o.x))
+            GreedEvent::TookLoot { by, .. } => {
+                cue(w.audio.sound("Troll.coinPickupSound"), troll_x(g, by))
             }
-            GreedEvent::PortalRebuilt(o) => {
-                cue(w.audio.sound("Portal.rebuildCompleteSound"), object(g, o).map(|o| o.x))
-            }
+            GreedEvent::PortalHit { object: o, .. } => cue(
+                w.audio.sound("Portal.provokedSound"),
+                object(g, o).map(|o| o.x),
+            ),
+            GreedEvent::PortalRebuilt(o) => cue(
+                w.audio.sound("Portal.rebuildCompleteSound"),
+                object(g, o).map(|o| o.x),
+            ),
             _ => {}
         },
+        GameEvent::BoulderBurst { x, .. } => cue(w.audio.sound("Boulder.explosionSound"), Some(x)),
+        GameEvent::BoulderImpact {
+            x,
+            collision_sound: true,
+            ..
+        } => {
+            cue(w.audio.sound("Boulder.collisionSound"), Some(x));
+        }
         GameEvent::CrownLost => cue(w.audio.sound("Player.lostCrownSound"), None),
         GameEvent::CrownRecovered => cue(w.audio.sound("Player.pickupCrownSound"), None),
         GameEvent::GameOver => {
@@ -232,7 +279,9 @@ pub fn on_event(w: &WorldData, g: &GameState, e: &GameEvent, cues: &mut Vec<Cue>
         GameEvent::Wild(game::wildlife::WildEvent::Hearts(x)) => {
             cue(w.audio.sound("Deer.attractedToPlayerSound"), Some(x))
         }
-        GameEvent::Bag(game::bag::BagEvent::Clink) => cue(w.audio.sound("BagCoin.coinTouchSound"), None),
+        GameEvent::Bag(game::bag::BagEvent::Clink) => {
+            cue(w.audio.sound("BagCoin.coinTouchSound"), None)
+        }
         _ => {}
     }
 }
@@ -339,7 +388,13 @@ impl Player {
     }
 
     /// orig: `AudioPool.Play`.
-    fn start<M: Mixer>(&mut self, w: &WorldData, m: &mut M, cue: Cue, listener: f32) -> Option<Voice> {
+    fn start<M: Mixer>(
+        &mut self,
+        w: &WorldData,
+        m: &mut M,
+        cue: Cue,
+        listener: f32,
+    ) -> Option<Voice> {
         let def = w.audio.sounds.get(cue.sound as usize)?;
         let (voices, last) = &mut self.pools[cue.sound as usize];
         if *last + def.min_retrigger > self.t {
@@ -376,7 +431,11 @@ impl Player {
 
     fn start_music<M: Mixer>(&mut self, w: &WorldData, m: &mut M, track: SoundId, listener: f32) {
         if let Some((v, t)) = self.music.take() {
-            self.fading.push((v, w.audio.sounds[t as usize].volume * MUSIC_VOLUME * MASTER * self.boost, 1.0));
+            self.fading.push((
+                v,
+                w.audio.sounds[t as usize].volume * MUSIC_VOLUME * MASTER * self.boost,
+                1.0,
+            ));
         }
         let cue = Cue {
             sound: track,
@@ -416,7 +475,11 @@ impl Player {
                 MusicCue::Fade => {
                     self.queued = None;
                     if let Some((v, t)) = self.music.take() {
-                        self.fading.push((v, w.audio.sounds[t as usize].volume * MUSIC_VOLUME * MASTER * self.boost, 1.0));
+                        self.fading.push((
+                            v,
+                            w.audio.sounds[t as usize].volume * MUSIC_VOLUME * MASTER * self.boost,
+                            1.0,
+                        ));
                     }
                 }
             }
@@ -455,7 +518,9 @@ impl Player {
                 Action::Run => "gallop",
                 _ => return None,
             };
-            sheet.clip(&format!("{}_{state}", steed.clips)).map(|c| c.length.max(0.05))
+            sheet
+                .clip(&format!("{}_{state}", steed.clips))
+                .map(|c| c.length.max(0.05))
         };
         let cycle_started = match clip(action) {
             Some(len) => action != last_action || (t / len).floor() > (last_t / len).floor(),
@@ -475,7 +540,16 @@ impl Player {
                     }
                 }
                 let x = (w.audio.sounds[sound as usize].spatial > 0.0).then_some(s.game.monarch.x);
-                let started = self.start(w, m, Cue { sound, x, clip: None }, s.camera_x);
+                let started = self.start(
+                    w,
+                    m,
+                    Cue {
+                        sound,
+                        x,
+                        clip: None,
+                    },
+                    s.camera_x,
+                );
                 voice = started.or(voice);
             }
         } else if action != last_action && clip(action).is_none() {
@@ -532,7 +606,12 @@ impl Player {
                 1.0
             };
             if region > 0.001 {
-                want.push((1 << 40 | i as u64, i as SoundId, def.volume * SOUND_VOLUME * MASTER * self.boost * region, 0.0));
+                want.push((
+                    1 << 40 | i as u64,
+                    i as SoundId,
+                    def.volume * SOUND_VOLUME * MASTER * self.boost * region,
+                    0.0,
+                ));
             }
         }
 
@@ -557,7 +636,11 @@ impl Player {
                     l.seen = true;
                     // orig: TimeBasedAudio fades over 2 s; object loops just follow.
                     l.gain = if key >> 40 == 1 {
-                        let rate = w.audio.sounds[sound as usize].volume * SOUND_VOLUME * MASTER * self.boost / 2.0;
+                        let rate = w.audio.sounds[sound as usize].volume
+                            * SOUND_VOLUME
+                            * MASTER
+                            * self.boost
+                            / 2.0;
                         approach(l.gain, gain, rate * dt)
                     } else {
                         gain
@@ -588,7 +671,9 @@ impl Player {
                 return true;
             }
             if l.key >> 40 == 1 && l.gain > 0.001 {
-                let rate = w.audio.sounds[l.sound as usize].volume * SOUND_VOLUME * MASTER * self.boost / 2.0;
+                let rate =
+                    w.audio.sounds[l.sound as usize].volume * SOUND_VOLUME * MASTER * self.boost
+                        / 2.0;
                 l.gain = approach(l.gain, 0.0, rate * dt);
                 m.set(l.voice, l.gain, 0.0);
                 return true;
@@ -621,6 +706,155 @@ fn forest_weight(g: &GameState, x: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn test_world() -> WorldData {
+        use game::data::{DayDef, DirectorDef, LevelConfigDef};
+        WorldData {
+            days: vec![DayDef {
+                name: "day".into(),
+                seasons: 7,
+                weathers: 1,
+                tracks: vec![],
+            }],
+            director: DirectorDef {
+                regular_days: vec![0],
+                boss_days: vec![0],
+                recovery_days: vec![0],
+                num_regular_days: (3, 4),
+                ..Default::default()
+            },
+            levels: vec![LevelConfigDef {
+                name: "island".into(),
+                autumn_start: (40, 40),
+                winter_start: (60, 60),
+                days_before_game_over: -1,
+                starting_coins: 0,
+                min_level_width: 0,
+                group_counts: vec![],
+                waves: Default::default(),
+                wave_timed_multiplier: 1.0,
+                wave_multiplier_timeframe: (0, -1),
+                season_change_days: 3.0,
+                income_multiplier: 1.0,
+                free_boat_parts: 0,
+                wave_boat_multiplier: 1.0,
+                force_all_unlocks: false,
+                defence_waves: [None; 3],
+                retaliation_waves: [None; 3],
+            }],
+            steeds: vec![Default::default()],
+            ..Default::default()
+        }
+    }
+
+    #[derive(Default)]
+    struct MixerLog {
+        plays: Vec<(AudioClipId, f32, f32)>,
+        failed: Option<Voice>,
+    }
+    impl Mixer for MixerLog {
+        fn play(&mut self, clip: AudioClipId, gain: f32, pan: f32, _: bool) -> Option<Voice> {
+            self.plays.push((clip, gain, pan));
+            Some(self.plays.len() as Voice)
+        }
+        fn set(&mut self, _: Voice, _: f32, _: f32) {}
+        fn stop(&mut self, _: Voice) {}
+        fn playing(&self, voice: Voice) -> bool {
+            self.failed != Some(voice)
+        }
+        fn pause(&mut self, _: bool) {}
+    }
+
+    #[test]
+    fn coin_impact_uses_event_position_for_symmetric_pan_and_distant_silence() {
+        let mut world = test_world();
+        world.audio.refs.push(("Coin.hitGroundSound".into(), 0));
+        world.audio.sounds.push(SoundDef {
+            clips: vec![0],
+            volume: 1.0,
+            spatial: 1.0,
+            min_distance: 1.0,
+            max_distance: 10.0,
+            max_simultaneous: 8,
+            ..Default::default()
+        });
+        let mut game = GameState::new(&world, 0, 1);
+        game.monarch.x = 0.0;
+        let mut player = Player::new(&world);
+        let mut mixer = MixerLog::default();
+        for x in [-30.0, -5.0, 5.0, 30.0] {
+            game.coins.drop(
+                Who::Unit(9),
+                (x, 0.01),
+                (0.0, -1.0),
+                game::coins::Policy::Nobody,
+                None,
+                None,
+            );
+            let mut events = Vec::new();
+            game.coins
+                .update(game::state::TICK, &[], |e| events.push(GameEvent::Coin(e)));
+            game.coins.list.clear(); // no entity lookup can supply its position now
+            let mut cues = Vec::new();
+            for event in events {
+                on_event(&world, &game, &event, &mut cues, &mut Vec::new());
+            }
+            assert_eq!(cues.len(), 1);
+            assert_eq!(cues[0].x, Some(x));
+            player.start(&world, &mut mixer, cues[0], 0.0);
+        }
+        assert_eq!(mixer.plays.len(), 2);
+        assert!(mixer.plays[0].1 > 0.0);
+        assert_eq!(mixer.plays[0].1, mixer.plays[1].1);
+        assert_eq!(mixer.plays[0].2, -mixer.plays[1].2);
+        assert!(mixer.plays[0].2 < 0.0);
+    }
+
+    #[test]
+    fn terminal_stream_failure_allows_the_next_queued_music_track() {
+        use crate::{
+            adpcm::{Adp, Channel},
+            stream::Source,
+        };
+        use std::io::Cursor;
+        let mut world = test_world();
+        world.audio.sounds = (0..2)
+            .map(|clip| SoundDef {
+                clips: vec![clip],
+                volume: 1.0,
+                max_simultaneous: 1,
+                group: SoundGroup::Music,
+                ..Default::default()
+            })
+            .collect();
+        let mut s = Session::new(world, 0, 1, game::progress::Progress::everything());
+        let mut player = Player::new(&s.world);
+        let mut mixer = MixerLog::default();
+        s.music_cues.push(MusicCue::Play(0));
+        player.update(&mut s, &Sheet::default(), &mut mixer, game::state::TICK);
+        s.music_cues.push(MusicCue::Queue(1));
+        let bytes = Adp {
+            rate: 22050,
+            samples: 14,
+            gain: 1.0,
+            channels: vec![Channel {
+                coefs: [0; 16],
+                data: vec![0; 8],
+            }],
+        }
+        .to_bytes();
+        let mut stream = Source::open(Cursor::new(bytes)).unwrap();
+        let (mut left, mut right) = ([0; 8], [0; 8]);
+        assert!(stream
+            .fill_pair([&mut left, &mut right], 14, |_, _| Err(
+                std::io::Error::other("injected DSP preparation failure")
+            ))
+            .is_err());
+        assert!(!stream.playing(true));
+        mixer.failed = Some(1); // the backend reports the terminal source as stopped
+        player.update(&mut s, &Sheet::default(), &mut mixer, game::state::TICK);
+        assert_eq!(mixer.plays.iter().map(|p| p.0).collect::<Vec<_>>(), [0, 1]);
+    }
+
     #[test]
     fn positioned_worker_strokes_fade_out_at_the_emitters_range() {
         let player = Player::new(&WorldData::default());

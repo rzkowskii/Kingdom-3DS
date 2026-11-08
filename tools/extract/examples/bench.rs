@@ -72,7 +72,7 @@ fn main() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(600);
     let world: WorldData =
-        postcard::from_bytes(&std::fs::read(dir.join("world.bin")).unwrap()).unwrap();
+        game::assetfile::decode_world(&std::fs::read(dir.join("world.bin")).unwrap()).unwrap();
     let read = |n: &str| std::fs::read_to_string(dir.join(n)).unwrap();
     let mut sheet = Sheet::from_json(
         &read("sprites.json"),

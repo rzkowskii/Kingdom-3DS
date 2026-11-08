@@ -82,12 +82,7 @@ impl Autopilot {
             });
         // A preferred site comes before recruiting, unless tools wait on racks
         // with nobody to take them.
-        let waiting = g
-            .population
-            .tools
-            .iter()
-            .filter(|t| t.shop.is_some())
-            .count();
+        let waiting = g.population.tools.iter().filter(|t| t.on_rack()).count();
         let takers = g.population.count(Role::Peasant);
         let preferred = site.is_some_and(|p| rank(p) < self.prefer.len()) && waiting <= takers;
         let site = site.map(|p| p.x);

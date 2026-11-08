@@ -6,7 +6,7 @@ use game::data::WorldData;
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let bytes = std::fs::read(&args[1]).expect("read world.bin");
-    let world: WorldData = postcard::from_bytes(&bytes).expect("decode");
+    let world: WorldData = game::assetfile::decode_world(&bytes).expect("decode");
     println!(
         "shield shop {:?} walls {:?} towers {:?} border {:?}",
         world.shield_shop, world.wall_prefabs, world.tower_prefabs, world.border

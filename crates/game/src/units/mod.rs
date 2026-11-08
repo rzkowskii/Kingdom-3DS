@@ -238,15 +238,18 @@ impl Mover {
         self.pause = self.pause.max(t);
     }
 
-    pub fn update(&mut self, x: &mut f32, dt: f32) {
+    /// Resolve the movement command without applying ground friction or moving
+    /// the root. Flying actors pass this command to their rigidbody integrator.
+    pub fn prepare_goal(&mut self, x: f32, dt: f32) -> Option<f32> {
         let mut target = None;
         if self.pause > 0.0 {
             self.pause -= dt;
-        } else {
+        }
+        if self.pause <= 0.0 {
             if let Some((g, speed)) = self.goal {
-                let d = (*x - g).abs();
+                let d = (x - g).abs();
                 if d > POSITION_EPSILON {
-                    self.facing = if g > *x { 1 } else { -1 };
+                    self.facing = if g > x { 1 } else { -1 };
                     let t = (d / RUBBER_BAND).min(1.0);
                     self.move_speed = 0.4 * speed + (speed - 0.4 * speed) * t;
                 } else {
@@ -256,6 +259,11 @@ impl Mover {
             }
             target = Some(self.move_speed * self.facing as f32);
         }
+        target
+    }
+
+    pub fn update(&mut self, x: &mut f32, dt: f32) {
+        let target = self.prepare_goal(*x, dt);
         match target {
             Some(t) if (t > 0.0 && t > self.vx) || (t < 0.0 && t < self.vx) => self.vx = t,
             _ => {
@@ -503,9 +511,20 @@ pub struct Tool {
     pub x: f32,
     pub y: f32,
     vy: f32,
-    /// Shop object id while on its rack. orig: `PayableShop._items`.
+    /// Shop object id while on its rack, or a dropped shield's banner owner.
+    /// orig: `PayableShop._items` / `DroppableShield`.
     pub shop: Option<u32>,
+    /// Rack index; `u8::MAX` denotes a dropped tool, including a shield that
+    /// retains its banner owner. This preserves the serialized Tool layout.
     pub slot: u8,
+}
+
+impl Tool {
+    /// Whether the tool occupies a shop rack, rather than lying loose with
+    /// a shield's banner association retained in `shop`.
+    pub fn on_rack(&self) -> bool {
+        self.shop.is_some() && self.slot != u8::MAX
+    }
 }
 
 /// orig: `BeggarCamp.SlowUpdate()` progress.
@@ -528,7 +547,10 @@ pub enum UnitEvent {
     Spawned(u32),
     BuildPoint(u32),
     /// A completed worker stroke, positioned before its target can disappear.
-    WorkSound { x: f32, tree: bool },
+    WorkSound {
+        x: f32,
+        tree: bool,
+    },
     TreeChopped(u32),
     PaidTaxes(u32),
     /// A farmer worked a field. orig: `Farmland.ReceiveFarming()`.
@@ -566,6 +588,32 @@ pub enum UnitEvent {
     },
 }
 
+/// A living enemy as citizens see it this tick. The transform position is
+/// separate from the collider bounds: orig: `Archer.TargetInRange` uses the
+/// former, while `Archer.BestShot` aims at `Collider2D.bounds.center`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct EnemyTarget {
+    pub id: u32,
+    pub x: f32,
+    pub y: f32,
+    pub vx: f32,
+    pub hp: i32,
+    pub bounds: Rect,
+}
+
+impl From<&crate::greed::Troll> for EnemyTarget {
+    fn from(troll: &crate::greed::Troll) -> Self {
+        Self {
+            id: troll.id,
+            x: troll.x,
+            y: troll.y,
+            vx: troll.mover.vx,
+            hp: troll.hp,
+            bounds: troll.box_at(),
+        }
+    }
+}
+
 /// Everything the units need to know about the rest of the game this tick.
 pub struct Ctx<'a> {
     pub world: &'a WorldData,
@@ -579,8 +627,7 @@ pub struct Ctx<'a> {
     pub monarch_x: f32,
     pub monarch_running: bool,
     pub forests: &'a [(f32, f32)],
-    /// Living trolls: (id, x, vx, hit points).
-    pub enemies: &'a [(u32, f32, f32, i32)],
+    pub enemies: &'a [EnemyTarget],
     /// x of every wall, to decide between low and high arrow arcs.
     pub walls: &'a [f32],
     pub farmlands: &'a [FarmInfo],
@@ -741,7 +788,10 @@ impl Population {
 
     /// Tools on a shop's rack. orig: `PayableShop.GetItemCount()`.
     pub fn rack_count(&self, shop: u32) -> u8 {
-        self.tools.iter().filter(|t| t.shop == Some(shop)).count() as u8
+        self.tools
+            .iter()
+            .filter(|t| t.shop == Some(shop) && t.on_rack())
+            .count() as u8
     }
 
     /// Puts a bought tool in the first free rack slot. orig: `PayableShop.Pay()` / `AddItem()`.
@@ -755,7 +805,7 @@ impl Population {
         let used: Vec<u8> = self
             .tools
             .iter()
-            .filter(|t| t.shop == Some(shop))
+            .filter(|t| t.shop == Some(shop) && t.on_rack())
             .map(|t| t.slot)
             .collect();
         let Some(slot) = (0..def.max_items).find(|s| !used.contains(s)) else {
@@ -794,7 +844,7 @@ impl Population {
         }
         // Tools fall to the ground when not on a rack.
         for t in &mut self.tools {
-            if t.shop.is_none() && t.y > 0.0 {
+            if !t.on_rack() && t.y > 0.0 {
                 t.vy -= crate::coins::GRAVITY * dt;
                 t.y = (t.y + t.vy * dt).max(0.0);
             }
@@ -1079,15 +1129,55 @@ impl Population {
         });
     }
 
-    /// A tool left the world (a troll took it). orig: `DroppableShield.OnDisable()`.
-    pub fn tool_lost(&mut self, tool: &Tool) {
-        if let Some(shop) = tool.shop {
-            if let Some(s) = self.shields.iter_mut().find(|s| s.object == shop) {
-                if s.status == ShieldStatus::Available {
-                    s.status = ShieldStatus::Empty;
+    /// Restore a thief's carried tool on death. A modern payload keeps its
+    /// identity; legacy saves only retained its kind and need a fresh id.
+    /// orig: `Troll.DropLoot` releases the existing droppable, with upward
+    /// impulse 1, while a shield keeps its `PayableShield` association.
+    pub(crate) fn release_stolen_tool(
+        &mut self,
+        kind: ToolKind,
+        id: Option<u32>,
+        shield_shop: Option<u32>,
+        x: f32,
+        y: f32,
+    ) {
+        let id = match id {
+            Some(id) => {
+                // Death effects are normally consumed once; don't duplicate
+                // an already restored payload if a caller repeats one.
+                if self.tools.iter().any(|t| t.id == id) {
+                    return;
                 }
+                self.next_id = self.next_id.max(id.saturating_add(1));
+                id
+            }
+            None => {
+                let id = self.next_id;
+                self.next_id += 1;
+                id
+            }
+        };
+        let shop = (kind == ToolKind::Shield).then_some(shield_shop).flatten();
+        if let Some(s) = shop.and_then(|id| self.shields.iter_mut().find(|s| s.object == id)) {
+            if matches!(s.status, ShieldStatus::Empty | ShieldStatus::Broken) {
+                s.status = ShieldStatus::Available;
             }
         }
+        self.tools.push(Tool {
+            id,
+            kind,
+            x,
+            y,
+            vy: 1.0,
+            shop,
+            slot: u8::MAX,
+        });
+    }
+
+    /// Carried tools remain in the population's identity space while absent
+    /// from `tools`; save validation must still reject unallocated ids.
+    pub(crate) fn tool_id_allocated(&self, id: u32) -> bool {
+        id < self.next_id
     }
 
     /// Archers following each knight.
@@ -1504,11 +1594,44 @@ impl Population {
         } else {
             Anim::Idle
         };
-        if anim != u.anim {
+        let entered = anim != u.anim;
+        let before = if entered { 0.0 } else { u.anim_t };
+        if entered {
             u.anim = anim;
             u.anim_t = 0.0;
         } else {
-            u.anim_t += dt;
+            let speed = if anim == Anim::Hammer {
+                ctx.world
+                    .animations
+                    .state_speed("worker", "Hammer")
+                    .unwrap_or(1.0)
+            } else {
+                1.0
+            };
+            u.anim_t += dt * speed;
+        }
+        if anim == Anim::Hammer {
+            use crate::animation::EventKind;
+            // Worker.OnAnimHammerHit is sound only. Workable.FinishWork keeps
+            // its separate workTime timer, even when the hammer hits earlier.
+            let hits = ctx.world.animations.clip("worker_hammer").map_or_else(
+                || {
+                    if ctx.world.animations.clips.is_empty() {
+                        crate::animation::event_occurrences(
+                            0.41666666, 1.0, true, before, u.anim_t, entered,
+                        )
+                    } else {
+                        0
+                    }
+                },
+                |clip| clip.event_count(EventKind::HammerHit, before, u.anim_t, entered),
+            );
+            for _ in 0..hits {
+                events(UnitEvent::WorkSound {
+                    x: u.x,
+                    tree: false,
+                });
+            }
         }
         tool_hit
     }
@@ -1825,7 +1948,11 @@ impl Population {
                 continue;
             }
             // orig: ballista crews never flee, so they wind it at night too.
-            let (lo, hi) = if night_post(world, o) { (portal_lo, portal_hi) } else { (lo, hi) };
+            let (lo, hi) = if night_post(world, o) {
+                (portal_lo, portal_hi)
+            } else {
+                (lo, hi)
+            };
             if o.x <= lo || o.x >= hi {
                 continue;
             }
@@ -2430,8 +2557,10 @@ fn worker_work(
     }
     // A stroke finished. orig: Workable.FinishWork → OnWorkFinish.
     u.works_before_moving -= 1;
-    events(UnitEvent::WorkSound { x: u.x, tree: is_tree });
     if is_tree {
+        // WorkableTree.OnWorkFinish plays the chop separately from the
+        // worker's animation-event hammer sound.
+        events(UnitEvent::WorkSound { x: u.x, tree: true });
         let o = &mut level.objects[i];
         o.chops_left -= 1;
         if o.chops_left <= 0 {
@@ -2514,7 +2643,7 @@ fn farmer_should_flee(u: &Unit, ctx: &Ctx) -> bool {
         && ctx
             .enemies
             .iter()
-            .any(|e| (e.1 - u.x).abs() <= FARMER_FLEE_RANGE)
+            .any(|e| (e.x - u.x).abs() <= FARMER_FLEE_RANGE)
 }
 
 /// The farmer's FSM: Idle → Farm while safe, Shelter when not, Flee from
@@ -2734,8 +2863,8 @@ fn archer_shoot(
         let trolls = ctx
             .enemies
             .iter()
-            .filter(|e| (e.1 - u.x).abs() <= RANGE && target_in_range(e.1 - u.x, -u.y))
-            .map(|e| (Quarry::Troll(e.0), e.3));
+            .filter(|e| (e.x - u.x).abs() <= RANGE && target_in_range(e.x - u.x, e.y - u.y))
+            .map(|e| (Quarry::Troll(e.id), e.hp));
         let portals = ctx
             .portals
             .iter()
@@ -2784,11 +2913,13 @@ fn archer_shoot(
         return;
     };
     let pos = match target {
-        Quarry::Troll(id) => ctx
-            .enemies
-            .iter()
-            .find(|e| e.0 == id)
-            .map(|e| (e.1, e.2, 0.35)),
+        Quarry::Troll(id) => ctx.enemies.iter().find(|e| e.id == id).map(|e| {
+            (
+                e.bounds.x + e.bounds.w * 0.5,
+                e.vx,
+                e.bounds.y + e.bounds.h * 0.5,
+            )
+        }),
         Quarry::Animal(id) => ctx
             .wildlife
             .iter()
@@ -3010,7 +3141,7 @@ fn archer_should_flee(u: &Unit, ctx: &Ctx) -> bool {
         && ctx
             .enemies
             .iter()
-            .map(|e| (e.1 - u.x).abs())
+            .map(|e| (e.x - u.x).abs())
             .min_by(f32::total_cmp)
             .is_some_and(|d| d < ARCHER_FLEE_RANGE)
 }
@@ -3053,6 +3184,370 @@ pub(crate) mod tests_support {
 mod tests {
     use super::*;
 
+    fn combat_world() -> WorldData {
+        WorldData {
+            levels: alloc::vec![crate::data::LevelConfigDef {
+                name: "archer-fixture".into(),
+                autumn_start: (40, 40),
+                winter_start: (60, 60),
+                days_before_game_over: -1,
+                starting_coins: 0,
+                min_level_width: 0,
+                group_counts: Vec::new(),
+                waves: Default::default(),
+                wave_timed_multiplier: 1.0,
+                wave_multiplier_timeframe: (0, -1),
+                season_change_days: 3.0,
+                income_multiplier: 1.0,
+                free_boat_parts: 0,
+                wave_boat_multiplier: 1.0,
+                force_all_unlocks: false,
+                defence_waves: [None; 3],
+                retaliation_waves: [None; 3],
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn unit_ctx<'a>(world: &'a WorldData, enemies: &'a [EnemyTarget]) -> Ctx<'a> {
+        Ctx {
+            world,
+            borders: Borders {
+                left: -10.0,
+                right: 10.0,
+            },
+            shelter: Borders {
+                left: -10.0,
+                right: 10.0,
+            },
+            campfire: 0.0,
+            daytime: true,
+            safe: true,
+            monarch_x: 0.0,
+            monarch_running: false,
+            forests: &[],
+            enemies,
+            walls: &[],
+            farmlands: &[],
+            slots: &[],
+            archer_statue: false,
+            knight_statue: false,
+            worker_statue: false,
+            portals: &[],
+            knights: KnightCtx::default(),
+            coat: crate::kingdom::CoatOfArms {
+                primary: [1.0; 3],
+                secondary: [0.5; 3],
+                emblem: [0.0; 3],
+            },
+            wildlife: &[],
+            closest_forest: (-20.0, 20.0),
+            boat: None,
+        }
+    }
+
+    #[test]
+    fn archer_range_uses_enemy_root_height_not_ground_or_collider_center() {
+        use crate::greed::EnemyKind;
+        let world = WorldData::default();
+        let mut rng = Rng::new(31);
+        let mut greed = crate::greed::Greed::default();
+        greed.spawn_troll(EnemyKind::Troll, 2.0, 0, false, &mut rng);
+        greed.spawn_troll(EnemyKind::Squid, 1.0, 0, false, &mut rng);
+        // The healthier flying target is unreachable, despite its close x.
+        greed.trolls[1].y = 3.0;
+        let targets: Vec<_> = greed.trolls.iter().map(EnemyTarget::from).collect();
+        let mut archer = Unit::new(10, Role::Archer, 0.0, &mut rng);
+        archer_shoot(
+            &mut archer,
+            1.0 / 60.0,
+            &unit_ctx(&world, &targets),
+            false,
+            &mut rng,
+            &mut |_| {},
+        );
+        assert_eq!(archer.shoot.unwrap().0, Quarry::Troll(greed.trolls[0].id));
+
+        // PC TargetInRange uses the root, even when the bounds centre would
+        // fail its discriminant. BestShot has its own aim point/fallback.
+        greed.trolls[1].y = 2.2;
+        let targets: Vec<_> = greed.trolls.iter().map(EnemyTarget::from).collect();
+        assert!(target_in_range(1.0, 2.2));
+        assert!(!target_in_range(1.0, 2.5));
+        let mut archer = Unit::new(11, Role::Archer, 0.0, &mut rng);
+        archer_shoot(
+            &mut archer,
+            1.0 / 60.0,
+            &unit_ctx(&world, &targets),
+            false,
+            &mut rng,
+            &mut |_| {},
+        );
+        assert_eq!(archer.shoot.unwrap().0, Quarry::Troll(greed.trolls[1].id));
+    }
+
+    #[test]
+    fn ground_and_tower_archers_hit_ground_and_airborne_colliders() {
+        use crate::director::Season;
+        use crate::greed::{EnemyKind, Greed, GreedCtx};
+        // Exercise actual slot placement, acquisition, draw, arrow spawn and
+        // collision. Reset target positions each tick to isolate aim geometry
+        // from accumulated squid motion; a blessed shot removes scatter.
+        for (height, kind, target_x, target_y) in [
+            (0.0, EnemyKind::Troll, 3.5, 0.0),
+            (0.0, EnemyKind::Squid, 2.0, 1.5),
+            (2.0, EnemyKind::Squid, 3.5, 2.2),
+        ] {
+            let world = combat_world();
+            let mut rng = Rng::new(73);
+            let mut greed = Greed::default();
+            greed.spawn_troll(kind, target_x, 0, false, &mut rng);
+            greed.trolls[0].y = target_y;
+            let hp = greed.trolls[0].hp;
+            let target = EnemyTarget::from(&greed.trolls[0]);
+            assert_eq!(target.y, target_y);
+            assert_eq!(target.bounds, greed.trolls[0].box_at());
+            let targets = [target];
+            let slots = [SlotInfo {
+                id: (40, 0),
+                x: 0.0,
+                y: height,
+            }];
+            let mut ctx = unit_ctx(&world, &targets);
+            ctx.archer_statue = true;
+            let mut population = Population::default();
+            population.spawn(Role::Archer, 0.0, &mut rng);
+            if height > 0.0 {
+                population.units[0].slot = Some(slots[0].id);
+                population.units[0].in_slot = true;
+                ctx.slots = &slots;
+            }
+            let mut level = Level::empty(-20.0, 40.0);
+            let mut coins = Coins::default();
+            let mut shot = None;
+            for _ in 0..60 {
+                population.update(
+                    1.0 / 60.0,
+                    &ctx,
+                    &mut level,
+                    &mut coins,
+                    &mut rng,
+                    |event| {
+                        if let UnitEvent::Arrow {
+                            x,
+                            y,
+                            vx,
+                            vy,
+                            missed,
+                            perfect,
+                        } = event
+                        {
+                            shot = Some((x, y, vx, vy, missed, perfect));
+                        }
+                    },
+                );
+                if shot.is_some() {
+                    break;
+                }
+            }
+            let (x, y, vx, vy, missed, perfect) = shot.expect("archer must release its shot");
+            assert!((y - (height + 0.4)).abs() < 1e-5);
+            assert!(perfect && !missed);
+            greed.shoot(x, y, vx, vy, missed, perfect);
+            let greed_ctx = GreedCtx {
+                obstacles: &[],
+                solid_obstacles: &[],
+                world: &world,
+                level_index: 0,
+                campfire: 0.0,
+                borders: ctx.borders,
+                monarch_x: 0.0,
+                monarch_has_crown: true,
+                targets: &[],
+                citizens: &[],
+                loot: &[],
+                portals: &[],
+                portal_infos: &[],
+                threats: &[],
+                season: Season::Summer,
+                day: 1,
+                boat: false,
+            };
+            let mut hit = false;
+            for _ in 0..120 {
+                greed.trolls[0].x = target_x;
+                greed.trolls[0].y = target_y;
+                greed.trolls[0].mover.vx = 0.0;
+                greed.update(
+                    1.0 / 60.0,
+                    12.0,
+                    &greed_ctx,
+                    &level,
+                    &mut [],
+                    &mut rng,
+                    |_| {},
+                );
+                if greed.trolls[0].hp < hp {
+                    hit = true;
+                    break;
+                }
+            }
+            assert!(
+                hit,
+                "{kind:?} at ({target_x}, {target_y}) missed from height {height}"
+            );
+        }
+    }
+
+    #[test]
+    fn recovered_tools_keep_identity_and_dropped_shields_keep_their_owner() {
+        let world = WorldData::default();
+        let mut rng = Rng::new(7);
+        let ctx = unit_ctx(&world, &[]);
+        let mut p = Population::default();
+        p.shields
+            .push(ShieldShop::new(20, 2.0, 0.0, ctx.coat, 0.0, &mut rng));
+        p.release_stolen_tool(ToolKind::Shield, Some(8), Some(20), 3.0, 1.0);
+        p.release_stolen_tool(ToolKind::Shield, Some(8), Some(20), 3.0, 1.0);
+        assert_eq!(p.tools.len(), 1);
+        assert_eq!(p.tools[0].id, 8);
+        assert_eq!(p.tools[0].shop, Some(20));
+        assert_eq!(p.tools[0].vy, 1.0);
+        assert_eq!(p.shields[0].status, ShieldStatus::Available);
+        assert_eq!(p.rack_count(20), 0);
+        assert!(p.tool_id_allocated(8));
+        p.update(
+            0.1,
+            &ctx,
+            &mut Level::empty(-20.0, 40.0),
+            &mut Coins::default(),
+            &mut rng,
+            |_| {},
+        );
+        assert!(
+            p.tools[0].y < 1.0,
+            "a dropped shield must fall despite retaining its owner"
+        );
+        assert_eq!(p.tools[0].shop, Some(20));
+        p.release_stolen_tool(ToolKind::Bow, None, Some(20), 0.0, 0.5);
+        assert_eq!(p.tools[1].id, 9);
+        assert_eq!(p.tools[1].shop, None);
+        assert!(!p.tool_id_allocated(10));
+    }
+
+    #[test]
+    fn recovering_an_old_shield_does_not_overwrite_a_taken_banner() {
+        let mut p = Population::default();
+        let mut rng = Rng::new(8);
+        let world = WorldData::default();
+        let ctx = unit_ctx(&world, &[]);
+        let mut shop = ShieldShop::new(20, 2.0, 0.0, ctx.coat, 0.0, &mut rng);
+        shop.status = ShieldStatus::Taken;
+        p.shields.push(shop);
+        p.release_stolen_tool(ToolKind::Shield, Some(3), Some(20), 1.0, 0.5);
+        assert_eq!(p.shields[0].status, ShieldStatus::Taken);
+    }
+
+    #[test]
+    fn hammer_impact_sound_uses_clip_marker_without_finishing_work_early() {
+        use crate::animation::{Clip, Event, EventKind};
+        let mut world = WorldData::default();
+        world.protos.push(crate::data::Proto {
+            building: Some(crate::data::BuildingDef {
+                build_points: 20,
+                auto_build_rate: 0.0,
+                scaffold: vec![],
+            }),
+            ..Default::default()
+        });
+        world.animations.clips.push((
+            "worker_hammer".into(),
+            Clip {
+                length: 1.0,
+                looping: true,
+                events: vec![Event {
+                    time: 0.41666666,
+                    kind: EventKind::HammerHit,
+                    float_parameter: 0.0,
+                    int_parameter: 0,
+                    string_parameter: Default::default(),
+                }],
+                ..Default::default()
+            },
+        ));
+        let ctx = unit_ctx(&world, &[]);
+        let mut level = Level::empty(-20.0, 40.0);
+        let target = level.add(crate::level::instantiate(
+            &world,
+            0,
+            crate::data::Layer::Game,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+        ));
+        level.objects[0].build = Some(0.0);
+        let mut p = Population::default();
+        let mut rng = Rng::new(73);
+        p.spawn(Role::Worker, 0.0, &mut rng);
+        p.units[0].ai = Ai::Work {
+            target,
+            working: true,
+            t: 0.0,
+        };
+        p.units[0].anim = Anim::Hammer;
+        p.units[0].works_before_moving = 10;
+        let mut coins = Coins::default();
+        let mut ev = Vec::new();
+        for _ in 0..24 {
+            p.update(1.0 / 60.0, &ctx, &mut level, &mut coins, &mut rng, |e| {
+                ev.push(e)
+            });
+        }
+        assert!(!ev.iter().any(|e| matches!(e, UnitEvent::WorkSound { .. })));
+        assert_eq!(level.objects[0].build, Some(0.0));
+        for _ in 0..3 {
+            p.update(1.0 / 60.0, &ctx, &mut level, &mut coins, &mut rng, |e| {
+                ev.push(e)
+            });
+        }
+        assert_eq!(
+            ev.iter()
+                .filter(|e| matches!(e, UnitEvent::WorkSound { tree: false, .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            level.objects[0].build,
+            Some(0.0),
+            "hammer sound is not FinishWork"
+        );
+        for _ in 0..20 {
+            p.update(1.0 / 60.0, &ctx, &mut level, &mut coins, &mut rng, |e| {
+                ev.push(e)
+            });
+        }
+        assert_eq!(
+            ev.iter()
+                .filter(|e| matches!(e, UnitEvent::BuildPoint(_)))
+                .count(),
+            1
+        );
+        assert!(level.objects[0].build.unwrap() > 0.0);
+        assert_eq!(
+            ev.iter()
+                .filter(|e| matches!(e, UnitEvent::WorkSound { .. }))
+                .count(),
+            1
+        );
+        // Inert/stunned interrupts animation and cannot emit a pending hit.
+        p.units[0].anim_t = 0.4;
+        p.units[0].stunned = 1.0;
+        ev.clear();
+        p.update(0.1, &ctx, &mut level, &mut coins, &mut rng, |e| ev.push(e));
+        assert!(!ev.iter().any(|e| matches!(e, UnitEvent::WorkSound { .. })));
+    }
+
     #[test]
     fn free_archers_balance_after_recruitment_and_losses_without_taking_specialists() {
         let mut rng = Rng::new(42);
@@ -3079,6 +3574,24 @@ mod tests {
         p.fetch_archer_for_slot((88, 0), -100.0);
         assert_eq!(p.units[0].slot, None);
         assert_eq!(p.units[0].follows, Some(99));
+    }
+
+    #[test]
+    fn flying_goal_resumes_on_pause_boundary_without_integrating_or_braking_body() {
+        let mut m = Mover::default();
+        m.set_goal(10., 1.3);
+        m.vx = 2.;
+        m.pause(0.125);
+        assert_eq!(m.prepare_goal(0., 0.0625), None);
+        assert_eq!(m.vx, 2.);
+        assert_eq!(m.prepare_goal(0., 0.0625), Some(1.3));
+        assert_eq!(
+            m.vx, 2.,
+            "flight integration applies drag; command preparation must not brake"
+        );
+        assert_eq!(m.prepare_goal(10., 0.01), Some(0.));
+        assert!(!m.moving_to_goal);
+        assert_eq!(m.vx, 2.);
     }
 
     #[test]

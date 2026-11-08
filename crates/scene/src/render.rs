@@ -57,12 +57,22 @@ impl Rect {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Draw {
     pub flip: bool,
+    pub flip_y: bool,
+    /// Row-major screen-space linear transform, applied around the sprite pivot.
+    pub affine: [f32; 4],
     pub tint: Color,
     pub scale: f32,
     /// Radians, clockwise on screen, around the pivot.
     pub angle: f32,
     /// orig: `SpriteFX` `recolorA` / `recolorB`.
     pub recolor: Option<(Color, Color)>,
+    /// SpriteFX color overlay: RGB interpolation, preserving sprite coverage.
+    pub overlay: Option<Color>,
+    /// ShadowReceiver material with coverage baked into the cloud sprite's alpha.
+    /// RGB is the light after applying the cloud's shadow exposure. Alpha is unused.
+    pub cloud_light: Option<Color>,
+    /// Top-left of the cloud's exposure mask in the dynamic atlas.
+    pub cloud_shadow: Option<[u16; 2]>,
     pub additive: bool,
     /// Filtered smoothly when scaled (glows); everything else stays pixel-sharp.
     pub smooth: bool,
@@ -72,10 +82,15 @@ impl Draw {
     pub fn tint(tint: Color) -> Draw {
         Draw {
             flip: false,
+            flip_y: false,
+            affine: [1.0, 0.0, 0.0, 1.0],
             tint,
             scale: 1.0,
             angle: 0.0,
             recolor: None,
+            overlay: None,
+            cloud_light: None,
+            cloud_shadow: None,
             additive: false,
             smooth: false,
         }
@@ -86,6 +101,16 @@ impl Draw {
         self
     }
 
+    pub fn flip_y(mut self, flip: bool) -> Draw {
+        self.flip_y = flip;
+        self
+    }
+
+    pub fn affine(mut self, basis: [f32; 4]) -> Draw {
+        self.affine = basis;
+        self
+    }
+
     pub fn recolor(mut self, a: Color, b: Color) -> Draw {
         self.recolor = Some((a, b));
         self
@@ -93,6 +118,18 @@ impl Draw {
 
     pub fn angle(mut self, angle: f32) -> Draw {
         self.angle = angle;
+        self
+    }
+
+    pub fn overlay(mut self, color: Color) -> Draw {
+        self.overlay = Some(color);
+        self
+    }
+
+    /// Selects the cloud material. Tint RGB is the authored ambient times
+    /// the cloud's base color, and tint alpha is vertex coverage.
+    pub fn cloud_light(mut self, light: Color) -> Draw {
+        self.cloud_light = Some(Color::new(light.r, light.g, light.b, 1.0));
         self
     }
 
@@ -112,9 +149,53 @@ impl Draw {
     }
 }
 
+/// Shared desktop/3DS geometry. UV flips change the pivot's offset but never
+/// mirror a child translation; whole-object reflection belongs in `affine`.
+pub fn sprite_corners(s: &crate::sheet::Sprite, at: (f32, f32), d: &Draw) -> [(f32, f32); 4] {
+    let px = if d.flip { s.w as f32 - s.px } else { s.px };
+    let py = if d.flip_y { s.h as f32 - s.py } else { s.py };
+    let rel = [
+        (-px, -py),
+        (s.w as f32 - px, -py),
+        (s.w as f32 - px, s.h as f32 - py),
+        (-px, s.h as f32 - py),
+    ];
+    let [a, b, c, e] = d.affine;
+    let (sin, cos) = d.angle.sin_cos();
+    let mut corners = rel.map(|(x, y)| {
+        let (x, y) = ((a * x + b * y) * d.scale, (c * x + e * y) * d.scale);
+        (at.0 + x * cos - y * sin, at.1 + x * sin + y * cos)
+    });
+    if d.scale == 1.0 && d.angle == 0.0 && d.affine == [1.0, 0.0, 0.0, 1.0] {
+        for p in &mut corners {
+            *p = (p.0.round(), p.1.round());
+        }
+    }
+    corners
+}
+
+/// Stereo replay must sample the same eye's previous reflection. If a right
+/// capture is unavailable, omit water reflection instead of borrowing left.
+pub fn reflection_page_for_right(page: u16, pages: [u16; 2], right_ready: bool) -> Option<u16> {
+    if page == pages[0] {
+        right_ready.then_some(pages[1])
+    } else {
+        Some(page)
+    }
+}
+
 /// Implemented by each backend (macroquad on desktop, citro3d on 3DS).
 /// Calls arrive in painter's order.
 pub trait Renderer {
+    /// Prepare the scene's cloud depth map and upload the visible receivers' masks.
+    fn cloud_shadows(
+        &mut self,
+        _camera: crate::cloud_shadow::Camera,
+        _clouds: &[crate::cloud_shadow::Sprite],
+    ) -> bool {
+        false
+    }
+
     fn clear(&mut self, c: Color);
     /// Sprite `id` (in the backend's `Sheet`) with its pivot at `at`.
     fn sprite(&mut self, id: u32, at: (f32, f32), d: Draw);
@@ -132,7 +213,12 @@ pub trait Renderer {
         let mid = |a: f32, b: f32| (a + b) / 2.0;
         self.add(
             r,
-            Color::new(mid(top.r, bottom.r), mid(top.g, bottom.g), mid(top.b, bottom.b), mid(top.a, bottom.a)),
+            Color::new(
+                mid(top.r, bottom.r),
+                mid(top.g, bottom.g),
+                mid(top.b, bottom.b),
+                mid(top.a, bottom.a),
+            ),
         );
     }
     fn circle(&mut self, x: f32, y: f32, radius: f32, c: Color);
@@ -146,4 +232,84 @@ pub trait Renderer {
     /// Stereo depth of what's drawn next: 0 at the screen, 1 farthest
     /// behind it, negative in front. Backends without 3D ignore it.
     fn depth(&mut self, _d: f32) {}
+}
+
+#[cfg(test)]
+mod transform_tests {
+    use super::*;
+    use crate::sheet::Sprite;
+
+    #[test]
+    fn cloud_material_keeps_vertex_opacity_and_ignores_light_alpha() {
+        let tint = Color::new(0.34, 0.28, 0.21, 0.4);
+        let plain = Draw::tint(tint);
+        let cloud = plain.cloud_light(Color::new(0.42, 0.12, 0.08, 0.0));
+        assert_eq!(plain.cloud_light, None);
+        assert_eq!(cloud.tint, tint);
+        assert_eq!(cloud.cloud_light, Some(Color::new(0.42, 0.12, 0.08, 1.0)));
+        assert_eq!(
+            plain.cloud_light(Color::BLACK).cloud_light,
+            Some(Color::BLACK)
+        );
+    }
+
+    #[test]
+    fn stereo_reflection_replay_never_samples_the_other_eyes_capture() {
+        assert_eq!(reflection_page_for_right(7, [7, 8], true), Some(8));
+        assert_eq!(reflection_page_for_right(7, [7, 8], false), None);
+        assert_eq!(reflection_page_for_right(3, [7, 8], false), Some(3));
+    }
+    #[test]
+    fn affine_quad_preserves_off_center_pivot_shear_and_both_renderer_flips() {
+        let s = Sprite {
+            page: 0,
+            x: 0,
+            y: 0,
+            w: 4,
+            h: 2,
+            px: 1.0,
+            py: 0.5,
+            masks: [None, None],
+        };
+        let d = Draw::tint(Color::WHITE).affine([2.0, 1.0, -1.0, 3.0]);
+        assert_eq!(
+            sprite_corners(&s, (20.0, 30.0), &d),
+            [(17.5, 29.5), (25.5, 25.5), (27.5, 31.5), (19.5, 35.5)]
+        );
+        let d = d.flip(true).flip_y(true);
+        assert_eq!(
+            sprite_corners(&s, (20.0, 30.0), &d),
+            [(12.5, 28.5), (20.5, 24.5), (22.5, 30.5), (14.5, 34.5)]
+        );
+    }
+    #[test]
+    fn whole_object_mirror_reflects_rotated_quad_about_root_not_child_pivot() {
+        let transform = game::data::Affine2 {
+            basis: [0.0, -2.0, 3.0, 0.0],
+            translation: [5.0, 2.0],
+        };
+        let sprite = Sprite {
+            page: 0,
+            x: 0,
+            y: 0,
+            w: 4,
+            h: 2,
+            px: 1.0,
+            py: 0.5,
+            masks: [None, None],
+        };
+        let a = sprite_corners(
+            &sprite,
+            (105.0, 48.0),
+            &Draw::tint(Color::WHITE).affine(transform.screen_basis(false)),
+        );
+        let b = sprite_corners(
+            &sprite,
+            (95.0, 48.0),
+            &Draw::tint(Color::WHITE).affine(transform.screen_basis(true)),
+        );
+        for (a, b) in a.into_iter().zip(b) {
+            assert_eq!(b, (200.0 - a.0, a.1));
+        }
+    }
 }

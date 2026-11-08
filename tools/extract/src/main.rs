@@ -7,12 +7,14 @@
 //! Current outputs (desktop):
 //! - `sprites/page_N.png` + `sprites.json`: every Sprite, cut out of Unity's
 //!   tightly packed atlases by its own mesh and repacked into ≤1024² pages.
-//! - `clips.json`: AnimationClips (sprite swaps and child position keys).
+//! - `clips.json`: versioned sprite keys, transform/color curves and event markers.
+//! - `animation-report.json`: retained coverage, duplicate aliases and unsupported features.
 //! - `scenes/{main,blocks}.json`, `prefabs.json`, `data.json`: object trees
 //!   and ScriptableObjects with all serialized fields (see `scenes.rs`).
-//! - `world.bin`: `game::data::WorldData` (postcard), what the game loads.
+//! - `world.bin`: versioned `game::data::WorldData` envelope (postcard payload).
 
 mod audio;
+mod boulder_fx;
 mod clips;
 mod fonts;
 mod pack;
@@ -21,7 +23,7 @@ mod sprites;
 mod world;
 mod yaml;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -74,6 +76,10 @@ fn main() -> ExitCode {
         );
         return ExitCode::FAILURE;
     }
+    if let Err(e) = std::fs::create_dir_all(&out) {
+        eprintln!("{}: {e}", out.display());
+        return ExitCode::FAILURE;
+    }
 
     let guids = guid_map(&assets);
     println!("indexed {} assets", guids.len());
@@ -90,6 +96,13 @@ fn main() -> ExitCode {
         sheet.sprites.len(),
         sheet.skipped
     );
+    let boulder_fx = match boulder_fx::extract(&assets, &guids, &mut sheet) {
+        Ok(effect) => effect,
+        Err(error) => {
+            eprintln!("boulder particles: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
 
     // The game's pixel font, as glyph sprites.
     match fonts::extract(&assets.join("Resources/fonts"), "Kingdom", "Font Texture") {
@@ -97,9 +110,7 @@ fn main() -> ExitCode {
             println!("font: {} glyphs", font.glyphs.len());
             sheet.sprites.extend(glyphs);
             let json = serde_json::to_string(&font).expect("font serialize");
-            if let Err(e) = std::fs::create_dir_all(&out)
-                .and_then(|_| std::fs::write(out.join("font.json"), json))
-            {
+            if let Err(e) = std::fs::write(out.join("font.json"), json) {
                 eprintln!("font: {e}");
                 return ExitCode::FAILURE;
             }
@@ -107,32 +118,43 @@ fn main() -> ExitCode {
         Err(e) => eprintln!("warning: font: {e}"),
     }
 
-    if let Err(e) = pack::write_pages(&sheet, &out.join("sprites"), &out.join("sprites.json")) {
-        eprintln!("packing: {e}");
-        return ExitCode::FAILURE;
-    }
-
-    match clips::extract_all(&assets.join("AnimationClip"), &sheet.names_by_guid) {
-        Ok(all) => {
-            let json = serde_json::to_string(&all).expect("clips serialize");
-            if let Err(e) = std::fs::write(out.join("clips.json"), json) {
-                eprintln!("clips: {e}");
-                return ExitCode::FAILURE;
-            }
-            println!("wrote {} clips", all.len());
-        }
+    let all_clips = match clips::extract_all(&assets.join("AnimationClip"), &sheet.names_by_guid) {
+        Ok(all) => all,
         Err(e) => {
             eprintln!("clips: {e}");
             return ExitCode::FAILURE;
         }
+    };
+    let file = clips::ClipFile {
+        version: clips::FORMAT_VERSION,
+        clips: &all_clips,
+    };
+    let json = serde_json::to_string(&file).expect("clips serialize");
+    if let Err(e) = std::fs::write(out.join("clips.json"), json) {
+        eprintln!("clips: {e}");
+        return ExitCode::FAILURE;
     }
+    let (animations, report) = match clips::library(&assets, &guids, &all_clips) {
+        Ok(result) => result,
+        Err(e) => {
+            eprintln!("animators: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Err(e) = clips::validate_gameplay(&animations) {
+        eprintln!("animation timelines: {e}");
+        return ExitCode::FAILURE;
+    }
+    if let Err(e) = std::fs::write(
+        out.join("animation-report.json"),
+        serde_json::to_string_pretty(&report).expect("report serialize"),
+    ) {
+        eprintln!("animation report: {e}");
+        return ExitCode::FAILURE;
+    }
+    println!("wrote {} clips; {} typed event markers; {} unsupported animation features (animation-report.json)", all_clips.len(), report.events, report.unsupported.len());
 
-    let sizes: world::SpriteSizes = sheet
-        .sprites
-        .iter()
-        .map(|s| (s.name.clone(), (s.img.w, s.img.h, s.ppu)))
-        .collect();
-    if let Err(e) = export_scenes(&assets, &guids, &out, &sheet.names_by_path, &sizes) {
+    if let Err(e) = export_scenes(&assets, &guids, &out, &mut sheet, animations, boulder_fx) {
         eprintln!("scenes: {e}");
         return ExitCode::FAILURE;
     }
@@ -158,8 +180,9 @@ fn export_scenes(
     assets: &Path,
     guids: &HashMap<String, PathBuf>,
     out: &Path,
-    sprite_names: &HashMap<String, String>,
-    sprite_sizes: &world::SpriteSizes,
+    sheet: &mut sprites::Sheet,
+    animations: game::animation::Library,
+    boulder_fx: boulder_fx::Pending,
 ) -> Result<(), String> {
     let r = scenes::Resolver::new(guids, assets);
     let main = scenes::export_file(&assets.join("main.unity"), &r)?;
@@ -203,16 +226,42 @@ fn export_scenes(
         &serde_json::Value::Object(data.clone()),
     )?;
 
+    let sizes: world::SpriteSizes = sheet
+        .sprites
+        .iter()
+        .map(|s| (s.name.clone(), (s.img.w, s.img.h, s.ppu)))
+        .collect();
     let (mut world, clip_paths) = world::build(&world::Inputs {
         main: &main,
         blocks: &blocks,
         loader: &loader,
         prefabs: &prefabs,
         data: &data,
-        sprite_names,
-        sprite_sizes,
+        sprite_names: &sheet.names_by_path,
+        sprite_sizes: &sizes,
         assets_dir: assets,
     })?;
+    boulder_fx.install(&mut world)?;
+    world.animations = animations;
+    if !world.transforms_valid() {
+        return Err("invalid extracted transform hierarchy".into());
+    }
+    let mut cloud_names: HashSet<_> = world
+        .clouds
+        .iter()
+        .flat_map(game::data::CloudsDef::sprite_ids)
+        .map(|id| world.sprites[usize::from(id)].as_str())
+        .collect();
+    for sprite in &mut sheet.sprites {
+        if cloud_names.remove(sprite.name.as_str()) {
+            sprites::bake_cloud_coverage(&mut sprite.img);
+        }
+    }
+    if !cloud_names.is_empty() {
+        return Err("missing cloud sprites in the cut sheet".into());
+    }
+    pack::write_pages(sheet, &out.join("sprites"), &out.join("sprites.json"))
+        .map_err(|e| format!("packing: {e}"))?;
     audio::convert(assets, out, &mut world.audio, &clip_paths)?;
     println!(
         "audio: {} sounds, {} clips ({:.0} s), {} script fields",
@@ -221,7 +270,8 @@ fn export_scenes(
         world.audio.clips.iter().map(|c| c.seconds).sum::<f32>(),
         world.audio.refs.len()
     );
-    let bytes = postcard::to_allocvec(&world).map_err(|e| e.to_string())?;
+    let bytes =
+        game::assetfile::encode(game::assetfile::Kind::World, &world).map_err(|e| e.to_string())?;
     std::fs::write(out.join("world.bin"), &bytes).map_err(|e| e.to_string())?;
     println!(
         "world: {} blocks, {} protos, {} scatterables, {} islands, {} lights, {} days ({} KiB)",

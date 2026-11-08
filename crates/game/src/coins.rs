@@ -338,12 +338,14 @@ impl Grabber {
 }
 
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum CoinEvent {
-    /// orig: `Coin.OnCollisionEnter2D()` → `hitGroundSound`.
+    /// Legacy serialized event; new collisions emit `HitGroundAt`.
     HitGround,
     /// orig: `Wallet.SuckCoin()` → `pickupSound`. The caller credits the wallet.
     PickedUp(Who),
+    /// orig: `Coin.OnCollisionEnter2D()` plays at the coin's transform.
+    HitGroundAt { x: f32 },
 }
 
 fn monarch_purse(m: &Monarch) -> (f32, f32) {
@@ -586,7 +588,7 @@ fn step_physics(c: &mut Coin, dt: f32, emit: &mut impl FnMut(CoinEvent)) {
         c.y = 0.0;
         if !c.hit_ground {
             c.hit_ground = true;
-            emit(CoinEvent::HitGround);
+            emit(CoinEvent::HitGroundAt { x: c.x });
         }
         c.vy = if -c.vy > BOUNCE_THRESHOLD {
             -c.vy * BOUNCINESS
@@ -621,6 +623,43 @@ mod tests {
     use crate::monarch::SteedStats;
 
     const DT: f32 = 1.0 / 60.0;
+
+    #[test]
+    #[cfg(feature = "save")]
+    fn old_coin_event_discriminants_remain_decodable() {
+        assert_eq!(
+            postcard::from_bytes::<CoinEvent>(&[0]).unwrap(),
+            CoinEvent::HitGround
+        );
+        let bytes = postcard::to_allocvec(&CoinEvent::HitGroundAt { x: 7.0 }).unwrap();
+        assert_eq!(bytes[0], 2, "new positioned variant is appended");
+        assert_eq!(
+            postcard::from_bytes::<CoinEvent>(&bytes).unwrap(),
+            CoinEvent::HitGroundAt { x: 7.0 }
+        );
+    }
+
+    #[test]
+    fn first_ground_impact_retains_its_actual_position_after_coin_retirement() {
+        let mut coins = Coins::default();
+        coins.drop(
+            Who::Unit(9),
+            (25.0, 0.01),
+            (3.0, -1.0),
+            Policy::Nobody,
+            None,
+            None,
+        );
+        let mut events = Vec::new();
+        coins.update(DT, &[], |event| events.push(event));
+        let expected_x = 25.0 + 3.0 * DT;
+        assert_eq!(events, [CoinEvent::HitGroundAt { x: expected_x }]);
+        for _ in 0..180 {
+            coins.update(DT, &[], |event| events.push(event));
+        }
+        coins.list.clear();
+        assert_eq!(events, [CoinEvent::HitGroundAt { x: expected_x }]);
+    }
 
     fn setup(coins: u32) -> (Coins, Monarch, Wallet, Rng) {
         let mut w = Wallet::default();

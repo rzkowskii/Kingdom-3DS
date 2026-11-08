@@ -11,8 +11,8 @@
 
 mod audio;
 mod gpu;
-mod storage;
 mod savefile;
+mod storage;
 
 use std::rc::Rc;
 
@@ -21,7 +21,6 @@ use game::controls::RawInput;
 use game::data::WorldData;
 use game::save;
 use game::state::TICK;
-use platform::Storage;
 use scene::session::Session;
 use scene::sheet::Sheet;
 use scene::{top, touch};
@@ -48,12 +47,13 @@ fn fail(gfx: &Gfx, hid: &mut Hid, apt: &Apt, msg: &str) {
 fn load() -> Result<(WorldData, u32, Sheet), String> {
     let bytes =
         std::fs::read(format!("{ROMFS}/world.bin")).map_err(|e| format!("world.bin: {e}"))?;
-    let world: WorldData = postcard::from_bytes(&bytes).map_err(|e| format!("world.bin: {e}"))?;
+    let world: WorldData =
+        game::assetfile::decode_world(&bytes).map_err(|e| format!("world.bin: {e}"))?;
     let world_id = save::fingerprint(&bytes);
     let sheet_bytes =
         std::fs::read(format!("{ROMFS}/sheet.bin")).map_err(|e| format!("sheet.bin: {e}"))?;
-    let mut sheet: Sheet =
-        postcard::from_bytes(&sheet_bytes).map_err(|e| format!("sheet.bin: {e}"))?;
+    let mut sheet: Sheet = game::assetfile::decode(game::assetfile::Kind::Sheet, &sheet_bytes)
+        .map_err(|e| format!("sheet.bin: {e}"))?;
     sheet.validate()?;
     sheet.link(&world.sprites);
     Ok((world, world_id, sheet))
@@ -82,7 +82,12 @@ fn main() {
         }
     };
     let sheet = Rc::new(sheet);
-    let mut gpu = match gpu::Gpu::new(sheet.clone(), ROMFS) {
+    let cloud_ids = world
+        .clouds
+        .iter()
+        .flat_map(game::data::CloudsDef::sprite_ids)
+        .filter_map(|id| sheet.world(id));
+    let mut gpu = match gpu::Gpu::new(sheet.clone(), ROMFS, cloud_ids) {
         Ok(g) => g,
         Err(e) => {
             fail(&gfx, &mut hid, &apt, &e);
@@ -92,22 +97,14 @@ fn main() {
 
     // Saves on the SD card. orig: PersistentManager's AUTO slot, UnlockManager's unlocks.
     let files = storage::SdCard::new();
-    let progress = files
-        .read(save::UNLOCKS_SLOT)
-        .and_then(|b| save::load_progress(&b).ok())
-        .unwrap_or_default();
+    let progress = Session::saved_progress(&files);
     let slot = Session::last_slot(&files);
-    let saved = files
-        .read(&save::game_slot(slot))
-        .and_then(|b| save::load_game(&b, world_id, &world).ok());
     let mut s = Session::new(world, 0, seed(), progress);
     s.storage = Some(Box::new(files));
     s.slot = slot;
     s.debug_lines = false;
     s.world_id = world_id;
-    if let Some(g) = saved {
-        s.resume(g);
-    }
+    s.load_from(slot);
     let mut sound = audio::Audio::new(SD_DIR, &s.world.audio);
     s.warning = sound.files_problem().unwrap_or_default();
     let mut player = scene::sound::Player::new(&s.world);
@@ -174,15 +171,18 @@ fn main() {
             chorded = false;
         }
         let select = held.contains(KeyPad::SELECT);
-        // Compare the depth-sorted renderer with plain painter's order.
-        if down.contains(KeyPad::X) {
-            gpu.painter = !gpu.painter;
-        }
-        // Dev: if the water's reflection comes out mirrored or misplaced,
-        // Y tries the other ways of reading the copied screen.
-        if down.contains(KeyPad::Y) && !select {
-            gpu.reflect_mode = (gpu.reflect_mode + 1) % 4;
-        }
+        let mut diagnostics = platform::diagnostics::RenderDiagnostics {
+            painter: gpu.painter,
+            reflection: gpu.reflect_mode,
+        };
+        diagnostics.update(
+            s.debug,
+            down.contains(KeyPad::X),
+            down.contains(KeyPad::Y),
+            select,
+        );
+        gpu.painter = diagnostics.painter;
+        gpu.reflect_mode = diagnostics.reflection;
         let raw = if map_open || s.paused {
             RawInput::default()
         } else {
@@ -225,6 +225,7 @@ fn main() {
         let t2 = std::time::Instant::now();
         gpu.screen(true);
         top::draw(&s, &sheet, &mut gpu);
+        gpu.capture_reflections(|gpu| top::draw_reflection_extras(&s, &sheet, gpu));
         gpu.screen(false);
         touch::draw(&s, &sheet, &mut gpu);
         let t_scene = std::time::Instant::now();
@@ -263,7 +264,7 @@ fn main() {
                 top.join("  "),
                 sound.status(),
                 format!(
-                "sim {:.1} ms ({ticks} ticks)  sound {:.1}  draw {:.1} (end {:.1})  wait {:.1}  gpu {:.1}  {} verts {} calls{} r{}",
+                "sim {:.1} ms ({ticks} ticks)  sound {:.1}  draw {:.1} (end {:.1})  wait {:.1}  gpu {:.1}  {} verts {} calls  {} reflection {}",
                 avg[0],
                 avg[3],
                 avg[1],
@@ -272,7 +273,7 @@ fn main() {
                 avg[5],
                 gpu.vertices(),
                 gpu.draws,
-                if gpu.painter { " (painter)" } else { "" },
+                if gpu.painter { "painter" } else { "depth" },
                 gpu.reflect_mode,
             ));
         }

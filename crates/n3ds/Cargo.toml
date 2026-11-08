@@ -12,7 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 game = { path = "../game", features = ["serde", "save", "profile"] }
-platform = { path = "../platform" }
+platform = { path = "../platform", features = ["std"] }
 scene = { path = "../scene" }
 citro3d-macros = { git = "https://github.com/rust3ds/citro3d-rs.git" }
 postcard = { version = "1.1.3", features = ["alloc"] }

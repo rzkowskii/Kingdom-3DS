@@ -73,6 +73,39 @@ pub struct Sheet {
     pub skipped: usize,
 }
 
+/// ShadowReceiver discards source alpha below .01 and uses half of the
+/// remaining alpha range for coverage. Its inverse supplies the light rim.
+/// RGB remains the authored cloud art.
+pub fn bake_cloud_coverage(image: &mut Image) {
+    for pixel in image.px.as_chunks_mut::<4>().0 {
+        let alpha = u16::from(pixel[3]);
+        pixel[3] = if alpha < 3 {
+            0
+        } else {
+            ((alpha + 256) / 2) as u8
+        };
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn cloud_coverage_matches_discard_and_half_alpha_without_touching_rgb() {
+    let mut image = Image {
+        w: 7,
+        h: 1,
+        px: [0, 1, 2, 3, 127, 254, 255]
+            .into_iter()
+            .flat_map(|alpha| [13, 29, 97, alpha])
+            .collect(),
+    };
+    bake_cloud_coverage(&mut image);
+    let expected: Vec<_> = [0, 0, 0, 129, 191, 255, 255]
+        .into_iter()
+        .flat_map(|alpha| [13, 29, 97, alpha])
+        .collect();
+    assert_eq!(image.px, expected);
+}
+
 struct Mesh {
     /// Vertex positions in source-atlas pixels, y up from the bottom.
     verts: Vec<(f32, f32)>,

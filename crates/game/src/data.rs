@@ -89,17 +89,113 @@ pub struct RandomSprite {
     pub shift_x: f32,
 }
 
+/// A 2D affine transform in world coordinates (Y up). Composing matrices
+/// preserves the shear produced by rotated, nonuniformly scaled parents.
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Affine2 {
+    /// Row-major linear basis: xx, xy, yx, yy.
+    pub basis: [f32; 4],
+    pub translation: [f32; 2],
+}
+
+impl Default for Affine2 {
+    fn default() -> Self {
+        Self::IDENTITY
+    }
+}
+
+impl Affine2 {
+    pub const IDENTITY: Self = Self {
+        basis: [1.0, 0.0, 0.0, 1.0],
+        translation: [0.0; 2],
+    };
+
+    pub fn from_pose(p: crate::animation::Pose) -> Self {
+        let [x, y, z, w] = p.rotation;
+        // Unity rotations are normalized quaternions. Normalize defensively
+        // because exported rounded components need not have exact unit length.
+        let n = x * x + y * y + z * z + w * w;
+        let k = if n > 0.0 { 2.0 / n } else { 0.0 };
+        Self {
+            basis: [
+                (1.0 - k * (y * y + z * z)) * p.scale[0],
+                k * (x * y - z * w) * p.scale[1],
+                k * (x * y + z * w) * p.scale[0],
+                (1.0 - k * (x * x + z * z)) * p.scale[1],
+            ],
+            translation: [p.position[0], p.position[1]],
+        }
+    }
+
+    /// Parent × local: a local point first goes through `local`, then `self`.
+    pub fn compose(self, local: Self) -> Self {
+        let [a, b, c, d] = self.basis;
+        let [e, f, g, h] = local.basis;
+        Self {
+            basis: [a * e + b * g, a * f + b * h, c * e + d * g, c * f + d * h],
+            translation: self.point(local.translation),
+        }
+    }
+
+    pub fn point(self, p: [f32; 2]) -> [f32; 2] {
+        let [a, b, c, d] = self.basis;
+        [
+            self.translation[0] + a * p[0] + b * p[1],
+            self.translation[1] + c * p[0] + d * p[1],
+        ]
+    }
+
+    /// Convert the world Y-up basis to screen Y-down, optionally reflecting
+    /// the whole object about its root (not each child about its own pivot).
+    pub fn screen_basis(self, mirrored: bool) -> [f32; 4] {
+        let [a, b, c, d] = self.basis;
+        let f = if mirrored { -1.0 } else { 1.0 };
+        [f * a, -f * b, -c, d]
+    }
+}
+
+/// An authored Transform, including ancestors without a SpriteRenderer.
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Clone, Debug, PartialEq)]
+pub struct TransformNode {
+    /// Relative to the prefab root, whose path is empty.
+    pub path: String,
+    pub parent: Option<u16>,
+    pub local: crate::animation::Pose,
+    /// Asset path of an enabled Animator's controller, when present.
+    pub animator: Option<String>,
+}
+
+/// Relative path inside an Animator's subtree; siblings are never animated.
+pub fn animation_path<'a>(path: &'a str, animator_root: &str) -> Option<&'a str> {
+    if animator_root.is_empty() {
+        Some(path)
+    } else if path == animator_root {
+        Some("")
+    } else {
+        path.strip_prefix(animator_root)?.strip_prefix('/')
+    }
+}
+
 /// One SpriteRenderer of a prototype, flattened to the prototype's root.
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Clone, Debug, PartialEq)]
 pub struct Part {
     pub sprite: Option<SpriteId>,
+    /// Unity layer 29: visible only to the extra water-reflection camera.
+    pub reflection_only: bool,
     /// Offset from the prototype root, in units (scale already applied).
     pub x: f32,
     pub y: f32,
     pub z: f32,
-    /// Combined mirroring from scales and `SpriteRenderer.flipX`.
+    /// The SpriteRenderer flip only; hierarchy mirroring is in `transform`.
     pub flip: bool,
+    pub flip_y: bool,
+    /// Full authored hierarchy transform, including scale and rotation.
+    pub transform: Affine2,
+    /// Transform node used to resolve animation paths.
+    pub node: u16,
     pub color: [u8; 4],
     /// orig: `SpriteRenderer.sortingLayer` value, then `sortingOrder`.
     pub sort_layer: i16,
@@ -157,6 +253,9 @@ pub struct UpgradeDef {
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ScaffoldModuleDef {
+    pub transform: Affine2,
+    pub flip: bool,
+    pub flip_y: bool,
     pub sprite: Option<SpriteId>,
     pub fill: Option<SpriteId>,
     /// Offset from the building root, in units.
@@ -376,6 +475,7 @@ pub struct Proto {
     pub tag: String,
     pub kind: Kind,
     pub parts: Vec<Part>,
+    pub transforms: Vec<TransformNode>,
     pub fixed: Option<FixedTransform>,
     pub scatter: Option<Scatter>,
     /// Half the object's width, for scattering. orig: `ScatteredObject.GetHalfWidth()`.
@@ -401,6 +501,8 @@ pub struct Proto {
     /// Has a `Wall` component (walls define the kingdom's borders).
     pub wall: bool,
     pub wall_def: Option<WallDef>,
+    /// Enabled authored colliders on Unity's Obstacles layer, in root-local coordinates.
+    pub obstacles: Vec<ObstacleDef>,
     pub portal: Option<PortalDef>,
     pub gaps: Option<Gaps>,
     pub farmhouse: Option<FarmhouseDef>,
@@ -646,6 +748,8 @@ pub struct CatapultDef {
     pub stuck_probability: f32,
     /// Where the boulder leaves from (the spoon), relative.
     pub spoon: (f32, f32),
+    /// Authored chassis, wheel, hinge and ground-contact physics.
+    pub recoil: Option<crate::recoil::Definition>,
 }
 
 /// orig: `DogSpawn`.
@@ -1007,6 +1111,318 @@ pub struct WorldData {
     pub water: WaterDef,
     pub audio: AudioDef,
     pub fire: FireStyleDef,
+    /// Authored animation curves, event markers and controller state metadata.
+    pub animations: crate::animation::Library,
+    /// MainCamera's authored anticipation and target-seeking curves.
+    pub camera: CameraDef,
+    /// Squid prefab flight, scanner and physical collider parameters.
+    pub squid: crate::flight::Definition,
+    /// Boss hand and force, plus the authored projectile used for throwback.
+    pub boss_throw: BossThrowDef,
+    /// The two Playground particle bursts referenced by Boulder. Synthetic worlds omit these.
+    pub boulder_fx: Option<BoulderFxDef>,
+    /// Exact `EnemyManager.redMoon` reference. Synthetic worlds may omit it.
+    pub red_moon: Option<u16>,
+    /// Sky `CloudController` instances. Synthetic worlds may omit these.
+    pub clouds: Option<CloudsDef>,
+}
+
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Clone, Debug, PartialEq)]
+pub struct CloudsDef {
+    pub stratus: CloudLayerDef,
+    pub cumulus: CloudLayerDef,
+    /// orig: `World.windChangeCooldown`.
+    pub wind_change_cooldown: f32,
+}
+
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Clone, Debug, PartialEq)]
+pub struct CloudLayerDef {
+    /// Controller origin in Unity world units. Cloud depth adds to Z.
+    pub origin: [f32; 3],
+    pub depth: f32,
+    /// Distance from the camera-following origin to either horizontal wrap edge.
+    pub width: f32,
+    pub wind_multiplier: f32,
+    pub lifetime: f32,
+    pub fade_time: f32,
+    pub vertical_motion: f32,
+    pub max_clouds: u16,
+    /// `RandomizeSprite.sprites`, in authored order, with the cloud shader's
+    /// coverage baked into alpha. Sample these with nearest filtering.
+    pub sprites: Vec<SpriteId>,
+    pub prefab_active: bool,
+    pub allow_flip: bool,
+    pub y_curve: Curve,
+    pub scale_curve: Curve,
+    pub parallax_curve: Curve,
+}
+
+impl CloudsDef {
+    pub fn sprite_ids(&self) -> impl Iterator<Item = SpriteId> + '_ {
+        self.stratus
+            .sprites
+            .iter()
+            .chain(&self.cumulus.sprites)
+            .copied()
+    }
+
+    pub fn valid(&self, sprite_count: usize) -> bool {
+        self.wind_change_cooldown > 0.0
+            && self.wind_change_cooldown <= 3600.0
+            && self.stratus.valid(sprite_count)
+            && self.cumulus.valid(sprite_count)
+    }
+}
+
+impl CloudLayerDef {
+    pub fn valid(&self, sprite_count: usize) -> bool {
+        let curve_valid = |curve: &Curve, min, max| {
+            (1..=16).contains(&curve.keys.len())
+                && curve.keys.iter().all(|&[t, v, incoming, outgoing]| {
+                    (0.0..=1.0).contains(&t)
+                        && (min..=max).contains(&v)
+                        && [incoming, outgoing]
+                            .into_iter()
+                            .all(|s| s.is_infinite() || s.abs() <= 100.0)
+                })
+                && curve.keys.windows(2).all(|k| k[0][0] < k[1][0])
+        };
+        self.origin.iter().all(|v| v.abs() <= 1000.0)
+            && (0.01..=100.0).contains(&self.depth)
+            && (0.01..=100.0).contains(&self.width)
+            && self.wind_multiplier.abs() <= 10.0
+            && (0.01..=60.0).contains(&self.fade_time)
+            && (2.0 * self.fade_time..=7200.0).contains(&self.lifetime)
+            && self.vertical_motion.abs() <= 10.0
+            && (1..=256).contains(&self.max_clouds)
+            && (1..=16).contains(&self.sprites.len())
+            && self
+                .sprites
+                .iter()
+                .all(|&id| usize::from(id) < sprite_count)
+            && curve_valid(&self.y_curve, -100.0, 100.0)
+            && curve_valid(&self.scale_curve, 0.01, 10.0)
+            && curve_valid(&self.parallax_curve, 0.0, 1.0)
+    }
+}
+
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Clone, Debug, PartialEq)]
+pub struct BoulderFxDef {
+    pub dust: BoulderEmitterDef,
+    pub fragments: BoulderEmitterDef,
+}
+
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Clone, Debug, PartialEq)]
+pub struct BoulderEmitterDef {
+    pub count: u8,
+    pub sprites: Vec<SpriteId>,
+    /// Dust advances through the row, while each fragment selects a row at birth.
+    pub animate: bool,
+    pub size: f32,
+    pub lifetime: [f32; 2],
+    pub scatter_min: [f32; 3],
+    pub scatter_max: [f32; 3],
+    pub velocity_min: [f32; 2],
+    pub velocity_max: [f32; 2],
+    /// Playground subtracts this vector in each update.
+    pub gravity: [f32; 2],
+    pub damping: f32,
+    pub rotation: [f32; 2],
+    pub spin: [f32; 2],
+    pub colors: Vec<BoulderGradientDef>,
+}
+
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BoulderGradientDef {
+    pub color: [f32; 4],
+    /// Fraction of the particle lifetime when its alpha begins to fade to zero.
+    pub fade_start: f32,
+}
+
+impl BoulderFxDef {
+    pub fn valid(&self, sprite_count: usize) -> bool {
+        [&self.dust, &self.fragments]
+            .into_iter()
+            .all(|emitter| emitter.valid(sprite_count))
+    }
+}
+
+impl BoulderEmitterDef {
+    fn valid(&self, sprite_count: usize) -> bool {
+        let range = |[min, max]: [f32; 2]| {
+            min.is_finite() && max.is_finite() && min <= max && min >= -1000.0 && max <= 1000.0
+        };
+        (1..=32).contains(&self.count)
+            && (1..=16).contains(&self.sprites.len())
+            && self.sprites.iter().all(|&id| (id as usize) < sprite_count)
+            && self.size.is_finite()
+            && (0.01..=2.0).contains(&self.size)
+            && range(self.lifetime)
+            && self.lifetime[0] > 0.0
+            && self.lifetime[1] <= 5.0
+            && self
+                .scatter_min
+                .into_iter()
+                .zip(self.scatter_max)
+                .all(|(min, max)| range([min, max]))
+            && self
+                .velocity_min
+                .into_iter()
+                .zip(self.velocity_max)
+                .all(|(min, max)| range([min, max]))
+            && self
+                .gravity
+                .into_iter()
+                .all(|g| g.is_finite() && g.abs() <= 100.0)
+            && (0.0..=10.0).contains(&self.damping)
+            && range(self.rotation)
+            && range(self.spin)
+            && (1..=8).contains(&self.colors.len())
+            && self.colors.iter().all(|gradient| {
+                gradient.color.iter().all(|v| (0.0..=1.0).contains(v))
+                    && (0.0..1.0).contains(&gradient.fade_start)
+            })
+    }
+}
+
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BossThrowDef {
+    pub force: (f32, f32),
+    /// Rest position of the direct Hand child, before facing is applied.
+    pub hand: [f32; 3],
+    pub boulder_radius: f32,
+    pub boulder_ghost: f32,
+    pub boulder_damage: i32,
+    pub boulder_max_hits: u8,
+    pub boulder_linear_drag: f32,
+    pub boulder_angular_drag: f32,
+    pub boulder_restitution: f32,
+    pub boulder_friction: f32,
+    pub gravity: f32,
+    pub fixed_step: f32,
+    /// Absolute PC world height. Projectile state stores ground-relative Y.
+    pub ground_y: f32,
+}
+
+impl Default for BossThrowDef {
+    /// Shipped PC values for synthetic worlds. Extraction reads the assets.
+    fn default() -> Self {
+        Self {
+            force: (4.0, 7.0),
+            hand: [0.4, 0.125, 0.0],
+            boulder_radius: 0.15625,
+            boulder_ghost: 0.3,
+            boulder_damage: 15,
+            boulder_max_hits: 5,
+            boulder_linear_drag: 0.1,
+            boulder_angular_drag: 1.5,
+            boulder_restitution: 0.5,
+            boulder_friction: 1.0,
+            gravity: 15.0,
+            fixed_step: 0.02,
+            ground_y: 0.8675,
+        }
+    }
+}
+
+impl BossThrowDef {
+    pub fn valid(&self) -> bool {
+        self.force.0 > 0.0
+            && self.force.0 <= self.force.1
+            && self.force.1 <= 100.0
+            && self.hand.iter().all(|x| x.abs() <= 10.0)
+            && self.boulder_radius > 0.0
+            && self.boulder_radius <= 10.0
+            && (0.0..=10.0).contains(&self.boulder_ghost)
+            && self.boulder_damage > 0
+            && self.boulder_max_hits > 0
+            && (0.0..=100.0).contains(&self.boulder_linear_drag)
+            && (0.0..=100.0).contains(&self.boulder_angular_drag)
+            && (0.0..=1.0).contains(&self.boulder_restitution)
+            && (0.0..=10.0).contains(&self.boulder_friction)
+            && self.gravity > 0.0
+            && self.gravity <= 100.0
+            && (0.001..=0.1).contains(&self.fixed_step)
+            && self.ground_y.abs() <= 10.0
+    }
+}
+
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct ObstacleDef {
+    /// Collider Transform origin, used by Squid.Chase when comparing obstacle/citizen X.
+    pub origin: [f32; 2],
+    /// Polygon vertices after all child transforms, before the placed object's transform.
+    pub points: Vec<[f32; 2]>,
+}
+
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct CameraDef {
+    pub lead: bool,
+    pub max_lead_speed: f32,
+    pub lead_over_time: Vec<crate::animation::Key>,
+    pub seek_speed_by_distance: Vec<crate::animation::Key>,
+    pub shake: CameraShakeDef,
+}
+
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CameraShakeDef {
+    pub duration: f32,
+    pub strength: [f32; 2],
+    pub vibrato: u8,
+    pub randomness: f32,
+}
+
+impl Default for CameraShakeDef {
+    fn default() -> Self {
+        Self {
+            duration: 1.0,
+            strength: [0.1875; 2],
+            vibrato: 20,
+            randomness: 30.0,
+        }
+    }
+}
+
+impl CameraShakeDef {
+    pub fn valid(&self) -> bool {
+        (0.0..=5.0).contains(&self.duration)
+            && self.duration > 0.0
+            && self.strength.into_iter().all(|s| (0.0..=2.0).contains(&s))
+            && self.vibrato > 0
+            && self.duration * f32::from(self.vibrato) <= 64.0
+            && (0.0..=180.0).contains(&self.randomness)
+    }
+}
+
+impl CameraDef {
+    pub fn valid(&self) -> bool {
+        self.max_lead_speed.is_finite()
+            && self.max_lead_speed >= 0.0
+            && self.shake.valid()
+            && [&self.lead_over_time, &self.seek_speed_by_distance]
+                .into_iter()
+                .all(|keys| {
+                    keys.windows(2).all(|k| k[0].time <= k[1].time)
+                        && keys.iter().all(|k| {
+                            k.time.is_finite()
+                                && k.time >= 0.0
+                                && k.value.is_finite()
+                                && [k.in_tangent, k.out_tangent].into_iter().all(|t| match t {
+                                    crate::animation::Tangent::Slope(v) => v.is_finite(),
+                                    crate::animation::Tangent::Step => true,
+                                })
+                        })
+                })
+    }
 }
 
 pub type SoundId = u16;
@@ -1198,6 +1614,99 @@ impl WaterDef {
 }
 
 impl Proto {
+    /// Reject malformed hierarchy references and nonfinite geometry before
+    /// render or socket sampling. Zero and negative authored scales are valid.
+    pub fn transforms_valid(&self) -> bool {
+        let affine = |a: Affine2| a.basis.iter().chain(&a.translation).all(|v| v.is_finite());
+        if self.transforms.len() > u16::MAX as usize + 1 {
+            return false;
+        }
+        let mut composed = Vec::<Affine2>::with_capacity(self.transforms.len());
+        for (i, n) in self.transforms.iter().enumerate() {
+            if n.parent.is_some_and(|p| p as usize >= i)
+                || !n
+                    .local
+                    .position
+                    .iter()
+                    .chain(&n.local.rotation)
+                    .chain(&n.local.scale)
+                    .chain(&n.local.color)
+                    .all(|v| v.is_finite())
+            {
+                return false;
+            }
+            let local = Affine2::from_pose(n.local);
+            let transform = n
+                .parent
+                .map_or(local, |p| composed[p as usize].compose(local));
+            if !affine(transform) {
+                return false;
+            }
+            composed.push(transform);
+        }
+        self.parts.iter().all(|p| {
+            (self.transforms.is_empty() || (p.node as usize) < self.transforms.len())
+                && [p.x, p.y, p.z].iter().all(|v| v.is_finite())
+                && affine(p.transform)
+        }) && self.building.as_ref().is_none_or(|b| {
+            b.scaffold
+                .iter()
+                .all(|m| [m.x, m.y, m.z].iter().all(|v| v.is_finite()) && affine(m.transform))
+        })
+    }
+
+    /// Compose a sampled hierarchy with the same ancestor order as Unity.
+    /// This is shared by visible poses and authoritative animated sockets.
+    pub fn sampled_transform(
+        &self,
+        node: u16,
+        mut sample: impl FnMut(&TransformNode) -> crate::animation::Pose,
+    ) -> Option<(Affine2, crate::animation::Pose)> {
+        fn visit(
+            nodes: &[TransformNode],
+            index: usize,
+            remaining: usize,
+            sample: &mut impl FnMut(&TransformNode) -> crate::animation::Pose,
+        ) -> Option<(Affine2, crate::animation::Pose)> {
+            if remaining == 0 {
+                return None;
+            }
+            let node = nodes.get(index)?;
+            let pose = sample(node);
+            let local = Affine2::from_pose(pose);
+            let transform = match node.parent {
+                Some(parent) => visit(nodes, parent as usize, remaining - 1, sample)?
+                    .0
+                    .compose(local),
+                None => local,
+            };
+            Some((transform, pose))
+        }
+        visit(
+            &self.transforms,
+            node as usize,
+            self.transforms.len(),
+            &mut sample,
+        )
+    }
+
+    /// A clip's paths are relative to its Animator Transform, not necessarily
+    /// to the prefab root. Missing channels retain authored local defaults.
+    pub fn clip_transform(
+        &self,
+        path: &str,
+        animator_root: &str,
+        clip: &crate::animation::Clip,
+        time: f32,
+    ) -> Option<Affine2> {
+        let index = self.transforms.iter().position(|n| n.path == path)?;
+        self.sampled_transform(index as u16, |node| {
+            animation_path(&node.path, animator_root)
+                .map_or(node.local, |path| clip.pose(path, time, node.local))
+        })
+        .map(|p| p.0)
+    }
+
     /// Takes part in the simulation (anything a system looks for). Everything
     /// else is scenery, which per-tick scans can skip.
     pub fn gameplay(&self) -> bool {
@@ -1245,6 +1754,10 @@ impl Proto {
 }
 
 impl WorldData {
+    pub fn transforms_valid(&self) -> bool {
+        self.protos.iter().all(Proto::transforms_valid)
+    }
+
     pub fn layer(&self, l: Layer) -> LayerDef {
         self.layers
             .get(l as usize)
@@ -1304,6 +1817,24 @@ pub struct LightPreset {
     pub enabled: u32,
     pub colors: [[f32; 4]; 17],
     pub floats: [f32; 8],
+}
+
+impl LightPreset {
+    pub fn is_red_moon_overlay(&self) -> bool {
+        const COLORS: [usize; 4] = [10, 11, 13, 14];
+        const STARS: usize = 5;
+        // The overlay owns moon tint, moon glow, cloud highlight, cloud
+        // stratus and stars. Weather owns the other channels.
+        const ENABLED: u32 = 0x0040_6c00;
+        self.category == 0
+            && !self.test_only
+            && self.enabled == ENABLED
+            && COLORS
+                .iter()
+                .flat_map(|&i| self.colors[i])
+                .chain([self.floats[STARS]])
+                .all(|v| (0.0..=1.0).contains(&v))
+    }
 }
 
 /// orig: `Day` asset.
@@ -1478,4 +2009,82 @@ pub struct WallDef {
     pub minimum_intact: f32,
     /// What's left when it falls. orig: `wreckPrefab`.
     pub wreck: Option<ProtoId>,
+}
+
+#[cfg(test)]
+mod transform_validation_tests {
+    use super::*;
+    use alloc::vec;
+    #[test]
+    fn malformed_transform_graphs_and_nonfinite_geometry_are_rejected() {
+        let mut p = Proto {
+            transforms: vec![
+                TransformNode {
+                    path: "".into(),
+                    parent: None,
+                    local: crate::animation::Pose::default(),
+                    animator: None,
+                },
+                TransformNode {
+                    path: "Child".into(),
+                    parent: Some(0),
+                    local: crate::animation::Pose {
+                        scale: [0.0, -1.3, 1.0],
+                        ..Default::default()
+                    },
+                    animator: None,
+                },
+            ],
+            ..Default::default()
+        };
+        assert!(
+            p.transforms_valid(),
+            "zero and mirrored scales are authored values"
+        );
+        p.transforms[0].parent = Some(1);
+        assert!(!p.transforms_valid());
+        p.transforms[0].parent = None;
+        p.transforms[1].parent = Some(1);
+        assert!(!p.transforms_valid());
+        p.transforms[1].parent = Some(0);
+        p.transforms[1].local.rotation[0] = f32::NAN;
+        assert!(!p.transforms_valid());
+        p.transforms[1].local.rotation[0] = 0.0;
+        p.transforms[0].local.scale[1] = f32::MAX;
+        p.transforms[1].local.scale[1] = 2.0;
+        assert!(
+            !p.transforms_valid(),
+            "finite inputs must not overflow on composition"
+        );
+        p.transforms[0].local.scale[1] = 1.0;
+        p.transforms[1].local.scale[1] = -1.3;
+        p.parts.push(Part {
+            reflection_only: false,
+            sprite: None,
+            x: 0.0,
+            y: 0.0,
+            z: 0.0,
+            flip: false,
+            flip_y: false,
+            transform: Affine2::IDENTITY,
+            node: 2,
+            color: [255; 4],
+            sort_layer: 0,
+            sort_order: 0,
+            random: None,
+            parent: None,
+            recolor: false,
+            lit: false,
+            scaffold: false,
+        });
+        assert!(!p.transforms_valid());
+        p.parts[0].node = 1;
+        assert!(p.transforms_valid());
+        p.parts[0].transform.basis[0] = f32::INFINITY;
+        assert!(!p.transforms_valid());
+        assert!(
+            Proto::default().transforms_valid(),
+            "empty test fixtures remain legal"
+        );
+    }
 }

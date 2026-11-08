@@ -53,7 +53,7 @@ fn diagnose_farms(g: &GameState, world: &WorldData) {
 fn main() {
     let path = std::env::args().nth(1).expect("world.bin path");
     let world: WorldData =
-        postcard::from_bytes(&std::fs::read(path).expect("read")).expect("decode");
+        game::assetfile::decode_world(&std::fs::read(path).expect("read")).expect("decode");
     let days: f32 = arg("--days").unwrap_or(5.0);
     let seed: u32 = arg("--seed").unwrap_or(1);
     let build = std::env::args().any(|a| a == "--build");

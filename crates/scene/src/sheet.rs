@@ -51,16 +51,19 @@ pub struct Sprite {
 
 /// Keys of a child's position: (time, x, y, stepped).
 pub type OffsetKeys = Vec<(f32, f32, f32, bool)>;
+/// Explicit null keyframes hide the renderer.
+pub type SpriteKeys = Vec<(f32, Option<u32>)>;
 
-/// An animation clip. orig: `AnimationClip` sprite and position curves.
+/// Sprite keys plus authored numeric curves/markers shared with simulation.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct Clip {
     pub length: f32,
     pub looping: bool,
     /// Per child path ("" = root): (time, sprite).
-    pub sprites: Vec<(String, Vec<(f32, u32)>)>,
+    pub sprites: Vec<(String, SpriteKeys)>,
     /// Per child path: (time, x, y, stepped).
     pub offsets: Vec<(String, OffsetKeys)>,
+    pub animation: game::animation::Clip,
 }
 
 impl Clip {
@@ -74,6 +77,11 @@ impl Clip {
 
     /// Sprite shown on `path` at time `t`. orig: Animator sampling of m_Sprite curves.
     pub fn sprite(&self, path: &str, t: f32) -> Option<u32> {
+        self.sprite_frame(path, t).flatten()
+    }
+
+    /// No track is None; an explicit null sprite key is Some(None).
+    pub fn sprite_frame(&self, path: &str, t: f32) -> Option<Option<u32>> {
         let keys = &self.sprites.iter().find(|k| k.0 == path)?.1;
         let t = self.wrap(t);
         keys.iter()
@@ -83,12 +91,31 @@ impl Clip {
             .map(|k| k.1)
     }
 
+    pub fn pose(&self, path: &str, t: f32, rest: game::animation::Pose) -> game::animation::Pose {
+        self.animation.pose(path, t, rest)
+    }
+
     pub fn has_offsets(&self, path: &str) -> bool {
-        self.offsets.iter().any(|k| k.0 == path)
+        self.animation
+            .tracks
+            .iter()
+            .any(|k| k.path == path && k.position.iter().any(|k| !k.is_empty()))
+            || self.offsets.iter().any(|k| k.0 == path)
     }
 
     /// Local position of child `path` at time `t`, in units.
     pub fn offset(&self, path: &str, t: f32) -> (f32, f32) {
+        if self
+            .animation
+            .tracks
+            .iter()
+            .any(|k| k.path == path && k.position.iter().any(|k| !k.is_empty()))
+        {
+            let p = self
+                .animation
+                .pose(path, t, game::animation::Pose::default());
+            return (p.position[0], p.position[1]);
+        }
         let Some(keys) = self.offsets.iter().find(|k| k.0 == path).map(|k| &k.1) else {
             return (0.0, 0.0);
         };
@@ -164,7 +191,8 @@ impl Sheet {
             || self.clips.iter().any(|(_, c)| {
                 c.sprites
                     .iter()
-                    .any(|(_, keys)| keys.iter().any(|&(_, id)| !valid(id)))
+                    .any(|(_, keys)| keys.iter().any(|&(_, id)| id.is_some_and(|id| !valid(id))))
+                    || !c.animation.validate()
             })
             || self
                 .font
@@ -257,8 +285,15 @@ mod json {
     struct ClipJson {
         length: f32,
         looping: bool,
-        sprites: HashMap<String, Vec<(f32, String)>>,
+        sprites: HashMap<String, Vec<(f32, Option<String>)>>,
         offsets: HashMap<String, Vec<(f32, f32, f32, bool)>>,
+        animation: game::animation::Clip,
+    }
+
+    #[derive(Deserialize)]
+    struct ClipFile {
+        version: u16,
+        clips: HashMap<String, ClipJson>,
     }
 
     impl Sheet {
@@ -266,8 +301,12 @@ mod json {
         pub fn from_json(sprites: &str, clips: &str, font: &str) -> Result<Sheet, String> {
             let f: FontJson = serde_json::from_str(font).map_err(|e| e.to_string())?;
             let s: SheetJson = serde_json::from_str(sprites).map_err(|e| e.to_string())?;
-            let c: HashMap<String, ClipJson> =
-                serde_json::from_str(clips).map_err(|e| e.to_string())?;
+            let file: ClipFile = serde_json::from_str(clips)
+                .map_err(|e| format!("animation data: {e}; regenerate assets"))?;
+            if file.version != 1 {
+                return Err("unsupported animation data version; regenerate assets".into());
+            }
+            let c = file.clips;
             let mut sheet = Sheet {
                 pages: s
                     .pages
@@ -312,17 +351,23 @@ mod json {
             let mut clips: Vec<(String, ClipJson)> = c.into_iter().collect();
             clips.sort_by(|a, b| a.0.cmp(&b.0));
             for (name, cj) in clips {
-                let mut sprites: Vec<(String, Vec<(f32, u32)>)> = cj
-                    .sprites
-                    .into_iter()
-                    .map(|(path, keys)| {
-                        let keys = keys
-                            .into_iter()
-                            .filter_map(|(t, n)| sheet.id(&n).map(|i| (t, i)))
-                            .collect();
-                        (path, keys)
-                    })
-                    .collect();
+                let mut sprites = Vec::new();
+                for (path, keys) in cj.sprites {
+                    let keys = keys
+                        .into_iter()
+                        .map(|(t, n)| {
+                            let id = n
+                                .map(|n| {
+                                    sheet
+                                        .id(&n)
+                                        .ok_or_else(|| format!("clip {name}: unknown sprite {n}"))
+                                })
+                                .transpose()?;
+                            Ok((t, id))
+                        })
+                        .collect::<Result<Vec<_>, String>>()?;
+                    sprites.push((path, keys));
+                }
                 sprites.sort_by(|a, b| a.0.cmp(&b.0));
                 let mut offsets: Vec<_> = cj.offsets.into_iter().collect();
                 offsets.sort_by(|a, b| a.0.cmp(&b.0));
@@ -333,6 +378,7 @@ mod json {
                         looping: cj.looping,
                         sprites,
                         offsets,
+                        animation: cj.animation,
                     },
                 ));
             }

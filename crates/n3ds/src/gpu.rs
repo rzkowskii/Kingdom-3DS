@@ -12,16 +12,16 @@
 //! - Everything else (soft-edged sprites, fades, haze, glows) follows in
 //!   painter's order, tested against that depth but not writing it.
 //!
-//! X switches to plain painter's order (no depth) to compare.
+//! With the debug overlay enabled, X switches to plain painter's order.
 //!
 //! Stereo 3D: every vertex carries its item's depth (from the scene's
 //! parallax), and the shader shifts it sideways per eye, so with the 3D
 //! slider up the top screen's draw calls simply run again for the right
 //! eye.
 //!
-//! The water reflects last frame's top screen: after the top screen is
-//! drawn, the GPU copies its colour buffer (tiled, sideways) into a texture
-//! the next frame samples.
+//! Water samples each eye's previous reflection capture. After drawing both
+//! eyes, an offscreen target adds reflection-only geometry to a copy of each
+//! color buffer; the visible framebuffers are never changed by that pass.
 //!
 //! There are no fragment shaders on the PICA200, so recolours are drawn as
 //! the sprite's two mask sprites (cut out by `pack3ds`) tinted on top.
@@ -30,12 +30,13 @@ use std::rc::Rc;
 
 use citro3d_sys as c3d;
 use ctru_sys as ctru;
+use scene::cloud_shadow::{self, ATLAS_HEIGHT, ATLAS_WIDTH};
 use scene::render::{Color, Draw, Rect, Renderer};
 use scene::sheet::{PageFormat, Sheet};
 
 static SHADER: &[u8] = citro3d_macros::include_shader!("../shaders/sprite.v.pica");
 
-/// Quads per frame (both screens). 16k quads = 1.5 MB of vertices.
+/// Quads per frame (both screens). 16k quads = 2 MiB of vertices.
 const MAX_QUADS: usize = 16384;
 /// Depth step between items in painter's order (24-bit depth buffer).
 const Z_STEP: f32 = 1.5e-5;
@@ -57,6 +58,8 @@ struct Vertex {
     pos: [f32; 4],
     uv: [f32; 2],
     color: [u8; 4],
+    /// Pixel coordinates in the cloud exposure atlas.
+    cloud_uv: [u16; 2],
 }
 
 type Quad = [Vertex; 4];
@@ -69,6 +72,18 @@ struct State {
     additive: bool,
     /// Linear filtering (scaled glows).
     smooth: bool,
+    effect: Effect,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Effect {
+    None,
+    /// Unlit overlay RGB and interpolation alpha, packed RGBA8.
+    Overlay(u32),
+    /// Unlit cloud highlight RGB, packed RGBA8.
+    Cloud(u32),
+    /// Cloud highlight with the per-texel exposure in texture unit 1.
+    ShadowedCloud(u32),
 }
 
 /// A step of a screen's drawing, kept to replay for the right eye.
@@ -101,6 +116,8 @@ pub struct Gpu {
     page_size: Vec<(f32, f32)>,
     /// Pages with 1-bit alpha (their sprites can go in the opaque pass).
     page_hard: Vec<bool>,
+    cloud_shadow: cloud_shadow::Pass,
+    cloud_exposure: Option<Box<c3d::C3D_Tex>>,
     pub sheet: Rc<Sheet>,
     verts: *mut Vertex,
     indices: *mut u16,
@@ -119,12 +136,15 @@ pub struct Gpu {
     pub painter: bool,
     bound_page: Option<(u16, bool)>,
     bound_textured: Option<Env>,
+    bound_effect: Option<Effect>,
     bound_additive: Option<bool>,
     /// Draw calls this frame.
     pub draws: u32,
     /// The page holding last frame's top screen, once one has been copied.
-    reflection: Option<u16>,
-    reflection_ready: bool,
+    reflection: Option<[u16; 2]>,
+    reflection_ready: [bool; 2],
+    /// Offscreen copy used to composite reflection-only geometry.
+    reflection_scratch: Option<Screen>,
     /// Drawing the top screen.
     on_top: bool,
     /// How screen pixels map to reflection texels (Y cycles them, in case
@@ -137,6 +157,7 @@ pub struct Gpu {
 enum Env {
     Solid,
     Textured,
+    ShadowedCloud,
     /// Texture colour, vertex alpha (the copied screen's alpha is unused).
     Reflection,
 }
@@ -151,7 +172,102 @@ fn clear_color(c: Color) -> u32 {
     u32::from_be_bytes([r, g, b, a])
 }
 
+/// PICA200 stores 8×8 tiles left to right, starting at the texture's top row.
+const fn morton8(x: usize, y: usize) -> usize {
+    (x & 1) | ((y & 1) << 1) | ((x & 2) << 1) | ((y & 2) << 2) | ((x & 4) << 2) | ((y & 4) << 3)
+}
+
+unsafe fn insert_cloud_alpha(
+    pass: &mut cloud_shadow::Pass,
+    id: u32,
+    sprite: &scene::sheet::Sprite,
+    tex: &mut c3d::C3D_Tex,
+) -> Result<(), String> {
+    let dims = tex.__bindgen_anon_2.__bindgen_anon_1;
+    let (width, height) = (usize::from(dims.width), usize::from(dims.height));
+    let (left, top) = (usize::from(sprite.x), usize::from(sprite.y));
+    let right = left + usize::from(sprite.w);
+    let bottom = top + usize::from(sprite.h);
+    let mut bytes = 0;
+    let data = c3d::C3D_Tex2DGetImagePtr(tex, 0, &mut bytes).cast::<u8>();
+    if tex.fmt() != ctru::GPU_RGBA8
+        || right > width
+        || bottom > height
+        || width % 8 != 0
+        || height % 8 != 0
+        || width.checked_mul(height).and_then(|n| n.checked_mul(4)) != Some(bytes as usize)
+        || data.is_null()
+    {
+        return Err(format!("cloud sprite {id} has an invalid RGBA8 texture"));
+    }
+    let data = std::slice::from_raw_parts(data, bytes as usize);
+    // RGBA8 is stored as A, B, G, R. Recover the baked cloud alpha once.
+    let alpha = (top..bottom).flat_map(|y| {
+        (left..right).map(move |x| {
+            let texel = (y & !7) * width + (x & !7) * 8 + morton8(x, y);
+            data[texel * 4]
+        })
+    });
+    pass.insert(id, sprite, alpha);
+    Ok(())
+}
+
+/// Offsets into eight input rows in GPU tile order.
+const CLOUD_TILE_OFFSETS: [usize; 64] = {
+    let mut offsets = [0; 64];
+    let mut y = 0;
+    while y < 8 {
+        let mut x = 0;
+        while x < 8 {
+            offsets[morton8(x, y)] = y * ATLAS_WIDTH as usize + x;
+            x += 1;
+        }
+        y += 1;
+    }
+    offsets
+};
+
+unsafe fn upload_cloud_exposure(tex: &mut c3d::C3D_Tex, atlas: cloud_shadow::Atlas<'_>) {
+    let width = usize::from(ATLAS_WIDTH);
+    let total = width * usize::from(ATLAS_HEIGHT);
+    let active = width * usize::from(atlas.height);
+    let data = std::slice::from_raw_parts_mut(tex.__bindgen_anon_1.data.cast::<u8>(), total);
+    let data = &mut data[..active];
+    for (rows, tiles) in atlas
+        .pixels
+        .chunks_exact(width * 8)
+        .zip(data.chunks_exact_mut(width * 8))
+    {
+        for (tile_x, tile) in tiles.chunks_exact_mut(64).enumerate() {
+            let source = &rows[tile_x * 8..];
+            for (texel, &offset) in tile.iter_mut().zip(&CLOUD_TILE_OFFSETS) {
+                *texel = source[offset];
+            }
+        }
+    }
+    let _ = ctru::GSPGPU_FlushDataCache(data.as_ptr().cast(), active as u32);
+    // Rebind after the CPU write to invalidate the GPU's texture cache.
+    c3d::C3D_TexBind(1, tex);
+}
+
 impl Screen {
+    unsafe fn offscreen(w: f32, h: f32) -> Option<Screen> {
+        let target = c3d::C3D_RenderTargetCreate(
+            h as i32,
+            w as i32,
+            ctru::GPU_RB_RGBA8,
+            c3d::C3D_DEPTHTYPE {
+                __e: ctru::GPU_RB_DEPTH24,
+            },
+        );
+        if target.is_null() {
+            return None;
+        }
+        let mut projection = std::mem::zeroed();
+        c3d::Mtx_OrthoTilt(&mut projection, 0.0, w, h, 0.0, 1.0, -1.0, true);
+        Some(Screen { target, projection })
+    }
+
     unsafe fn new(screen: ctru::gfxScreen_t, side: ctru::gfx3dSide_t, w: f32, h: f32) -> Screen {
         // The screens are mounted sideways: targets are 240 wide.
         let target = c3d::C3D_RenderTargetCreate(
@@ -181,7 +297,11 @@ impl Screen {
 impl Gpu {
     /// Sets up citro3d (after `Gfx::new`) and loads the sheet's pages from
     /// `dir` (romfs).
-    pub fn new(sheet: Rc<Sheet>, dir: &str) -> Result<Gpu, String> {
+    pub fn new(
+        sheet: Rc<Sheet>,
+        dir: &str,
+        cloud_ids: impl Iterator<Item = u32>,
+    ) -> Result<Gpu, String> {
         unsafe {
             if !c3d::C3D_Init(c3d::C3D_DEFAULT_CMDBUF_SIZE as usize) {
                 return Err("citro3d failed to start".into());
@@ -247,20 +367,72 @@ impl Gpu {
                 .iter()
                 .map(|p| p.format == PageFormat::Rgba5551)
                 .collect();
-            // The reflection: one more page, in VRAM where the copy lands.
-            let mut tex: Box<c3d::C3D_Tex> = Box::new(std::mem::zeroed());
-            let reflection = if c3d::C3D_TexInitVRAM(tex.as_mut(), 256, 512, ctru::GPU_RGBA8) {
+            let mut cloud_shadow = cloud_shadow::Pass::default();
+            let mut cloud_ids = cloud_ids.peekable();
+            let cloud_exposure = if cloud_ids.peek().is_some() {
+                for id in cloud_ids {
+                    let sprite = sheet.get(id);
+                    insert_cloud_alpha(
+                        &mut cloud_shadow,
+                        id,
+                        sprite,
+                        pages[usize::from(sprite.page)].as_mut(),
+                    )?;
+                }
+                let mut tex: Box<c3d::C3D_Tex> = Box::new(std::mem::zeroed());
+                if c3d::C3D_TexInit(tex.as_mut(), ATLAS_WIDTH, ATLAS_HEIGHT, ctru::GPU_A8) {
+                    tex.__bindgen_anon_1
+                        .data
+                        .cast::<u8>()
+                        .write_bytes(255, usize::from(ATLAS_WIDTH) * usize::from(ATLAS_HEIGHT));
+                    c3d::C3D_TexFlush(tex.as_mut());
+                    c3d::C3D_TexSetFilter(tex.as_mut(), ctru::GPU_NEAREST, ctru::GPU_NEAREST);
+                    c3d::C3D_TexSetWrap(
+                        tex.as_mut(),
+                        ctru::GPU_CLAMP_TO_EDGE,
+                        ctru::GPU_CLAMP_TO_EDGE,
+                    );
+                    Some(tex)
+                } else {
+                    eprintln!("cloud shadows disabled: insufficient texture memory");
+                    None
+                }
+            } else {
+                None
+            };
+            // Separate retained captures for each eye; never reuse the left
+            // image for right-eye water. A failed allocation disables reflections.
+            let mut reflection_textures = Vec::new();
+            for _ in 0..2 {
+                let mut tex: Box<c3d::C3D_Tex> = Box::new(std::mem::zeroed());
+                if !c3d::C3D_TexInitVRAM(tex.as_mut(), 256, 512, ctru::GPU_RGBA8) {
+                    break;
+                }
                 c3d::C3D_TexSetFilter(tex.as_mut(), ctru::GPU_NEAREST, ctru::GPU_NEAREST);
                 c3d::C3D_TexSetWrap(
                     tex.as_mut(),
                     ctru::GPU_CLAMP_TO_EDGE,
                     ctru::GPU_CLAMP_TO_EDGE,
                 );
-                pages.push(tex);
-                page_size.push((256.0, 512.0));
-                page_hard.push(true);
-                Some((pages.len() - 1) as u16)
+                reflection_textures.push(tex);
+            }
+            let mut reflection_scratch = Screen::offscreen(400.0, 240.0);
+            let reflection = if reflection_textures.len() == 2 && reflection_scratch.is_some() {
+                let ids = [pages.len() as u16, pages.len() as u16 + 1];
+                for tex in reflection_textures {
+                    pages.push(tex);
+                    page_size.push((256.0, 512.0));
+                    page_hard.push(true);
+                }
+                Some(ids)
             } else {
+                for mut tex in reflection_textures {
+                    c3d::C3D_TexDelete(tex.as_mut());
+                }
+                if let Some(scratch) = reflection_scratch.take() {
+                    c3d::C3D_RenderTargetDelete(scratch.target);
+                }
+                eprintln!("water reflections disabled: insufficient render-target memory");
                 None
             };
 
@@ -292,6 +464,8 @@ impl Gpu {
                 pages,
                 page_size,
                 page_hard,
+                cloud_shadow,
+                cloud_exposure,
                 sheet,
                 verts,
                 indices,
@@ -303,10 +477,12 @@ impl Gpu {
                 painter: false,
                 bound_page: None,
                 bound_textured: None,
+                bound_effect: None,
                 bound_additive: None,
                 draws: 0,
                 reflection,
-                reflection_ready: false,
+                reflection_ready: [false; 2],
+                reflection_scratch,
                 on_top: false,
                 reflect_mode: 0,
             })
@@ -323,14 +499,15 @@ impl Gpu {
             c3d::AttrInfo_AddLoader(attr, 0, ctru::GPU_FLOAT, 4);
             c3d::AttrInfo_AddLoader(attr, 1, ctru::GPU_FLOAT, 2);
             c3d::AttrInfo_AddLoader(attr, 2, ctru::GPU_UNSIGNED_BYTE, 4);
+            c3d::AttrInfo_AddLoader(attr, 3, ctru::GPU_SHORT, 2);
             let buf = c3d::C3D_GetBufInfo();
             c3d::BufInfo_Init(buf);
             c3d::BufInfo_Add(
                 buf,
                 self.verts as *const _,
                 std::mem::size_of::<Vertex>() as isize,
-                3,
-                0x210,
+                4,
+                0x3210,
             );
             c3d::C3D_CullFace(ctru::GPU_CULL_NONE);
             // Clear pixels never count.
@@ -344,6 +521,7 @@ impl Gpu {
     fn unbind(&mut self) {
         self.bound_page = None;
         self.bound_textured = None;
+        self.bound_effect = None;
         self.bound_additive = None;
     }
 
@@ -401,7 +579,17 @@ impl Gpu {
         for &c in &calls {
             match c {
                 Call::Pass(opaque) => self.depth_test(opaque),
-                Call::Draw(state, first, n) => unsafe {
+                Call::Draw(mut state, first, n) => unsafe {
+                    if let (Some(page), Some(pages)) = (state.page, self.reflection) {
+                        let Some(page) = scene::render::reflection_page_for_right(
+                            page,
+                            pages,
+                            self.reflection_ready[1],
+                        ) else {
+                            continue;
+                        };
+                        state.page = Some(page);
+                    }
                     self.bind(state);
                     c3d::C3D_DrawElements(
                         ctru::GPU_TRIANGLES,
@@ -429,28 +617,92 @@ impl Gpu {
         }
     }
 
-    /// Queues a copy of the top screen, once drawn, into the reflection page.
-    fn capture_top(&mut self) {
-        let Some(p) = self.reflection else { return };
+    fn submit_before_copy(&self) {
         unsafe {
-            // Publish vertices before the split submits their draw commands.
             let _ = ctru::GSPGPU_FlushDataCache(
                 self.verts as *const _,
                 (self.quads * 4 * std::mem::size_of::<Vertex>()) as u32,
             );
-            // Submit the top screen's commands so the copy runs after them.
             c3d::C3D_FrameSplit(GX_CMDLIST_FLUSH);
-            let dim = |line: u32, gap: u32| ((gap / 16) << 16) | (line / 16);
-            let _ = ctru::GX_TextureCopy(
-                (*self.top.target).frameBuf.colorBuf as *mut u32,
-                dim(TOP_TILE_ROW, 0),
-                self.pages[p as usize].__bindgen_anon_1.data as *mut u32,
-                dim(TOP_TILE_ROW, REFLECTION_TILE_ROW - TOP_TILE_ROW),
-                TOP_TILE_ROW * TOP_TILE_ROWS,
-                c3d::GX_TRANSFER_RAW_COPY(true),
-            );
         }
-        self.reflection_ready = true;
+    }
+
+    /// PC MainCamera.OnPostRender: copy the visible scene, then render the
+    /// reflection camera's extra layer. The visible framebuffer is untouched.
+    pub fn capture_reflections(&mut self, extras: impl FnMut(&mut Self)) {
+        if !self.on_top {
+            return;
+        }
+        self.flush(); // includes right-eye replay while on_top is true
+        self.capture_reflections_after_flush(extras);
+    }
+
+    fn capture_reflections_after_flush(&mut self, mut extras: impl FnMut(&mut Self)) {
+        self.on_top = false;
+        let (Some(pages), Some(scratch)) = (self.reflection, &self.reflection_scratch) else {
+            return;
+        };
+        let scratch_target = scratch.target;
+        let projection = scratch.projection;
+        let dim = |line: u32, gap: u32| ((gap / 16) << 16) | (line / 16);
+        let eyes = if self.stereo > 0.0 { 2 } else { 1 };
+        if eyes == 1 {
+            self.reflection_ready[1] = false;
+        }
+        for (eye, page) in pages.into_iter().enumerate().take(eyes) {
+            self.reflection_ready[eye] = false;
+            let source = if eye == 0 {
+                self.top.target
+            } else {
+                self.right.target
+            };
+            unsafe {
+                c3d::C3D_RenderTargetClear(scratch_target, c3d::C3D_CLEAR_DEPTH, 0, 0);
+                self.submit_before_copy();
+                let result = ctru::GX_TextureCopy(
+                    (*source).frameBuf.colorBuf as *mut u32,
+                    dim(TOP_TILE_ROW, 0),
+                    (*scratch_target).frameBuf.colorBuf as *mut u32,
+                    dim(TOP_TILE_ROW, 0),
+                    TOP_TILE_ROW * TOP_TILE_ROWS,
+                    c3d::GX_TRANSFER_RAW_COPY(true),
+                );
+                if result < 0 {
+                    continue;
+                }
+                c3d::C3D_FrameDrawOn(scratch_target);
+                c3d::C3D_FVUnifMtx4x4(ctru::GPU_VERTEX_SHADER, self.projection_loc, &projection);
+                let shift = if eye == 0 {
+                    -self.stereo / 2.0
+                } else {
+                    self.stereo / 2.0
+                };
+                c3d::C3D_FVUnifSet(ctru::GPU_VERTEX_SHADER, self.eye_loc, shift, 0.0, 0.0, 0.0);
+            }
+            self.depth = 0.0;
+            self.unbind();
+            extras(self);
+            self.flush();
+            self.submit_before_copy();
+            let result = unsafe {
+                ctru::GX_TextureCopy(
+                    (*scratch_target).frameBuf.colorBuf as *mut u32,
+                    dim(TOP_TILE_ROW, 0),
+                    self.pages[page as usize].__bindgen_anon_1.data as *mut u32,
+                    dim(TOP_TILE_ROW, REFLECTION_TILE_ROW - TOP_TILE_ROW),
+                    TOP_TILE_ROW * TOP_TILE_ROWS,
+                    c3d::GX_TRANSFER_RAW_COPY(true),
+                )
+            };
+            self.reflection_ready[eye] = result >= 0;
+        }
+        self.unbind();
+    }
+
+    fn capture_top(&mut self) {
+        // screen()/end() have already flushed. Repeating flush here would
+        // replay an empty right-eye list and clear its finished framebuffer.
+        self.capture_reflections_after_flush(|_| {});
     }
 
     /// GPU time of the last finished frame, in ms.
@@ -478,14 +730,15 @@ impl Gpu {
     unsafe fn bind(&mut self, state: State) {
         let mode = match state.page {
             None => Env::Solid,
-            Some(p) if Some(p) == self.reflection => Env::Reflection,
+            Some(p) if self.reflection.is_some_and(|pages| pages.contains(&p)) => Env::Reflection,
+            Some(_) if matches!(state.effect, Effect::ShadowedCloud(_)) => Env::ShadowedCloud,
             Some(_) => Env::Textured,
         };
         if self.bound_textured != Some(mode) {
             let env = c3d::C3D_GetTexEnv(0);
             c3d::C3D_TexEnvInit(env);
             match mode {
-                Env::Textured => {
+                Env::Textured | Env::ShadowedCloud => {
                     c3d::C3D_TexEnvSrc(
                         env,
                         c3d::C3D_Both,
@@ -494,6 +747,22 @@ impl Gpu {
                         0,
                     );
                     c3d::C3D_TexEnvFunc(env, c3d::C3D_Both, ctru::GPU_MODULATE);
+                    if mode == Env::ShadowedCloud {
+                        // Keep coverage × fade in alpha while RGB builds the rim.
+                        c3d::C3D_TexEnvSrc(
+                            env,
+                            c3d::C3D_RGB,
+                            ctru::GPU_CONSTANT,
+                            ctru::GPU_TEXTURE0,
+                            0,
+                        );
+                        c3d::C3D_TexEnvOpRgb(
+                            env,
+                            ctru::GPU_TEVOP_RGB_SRC_COLOR,
+                            ctru::GPU_TEVOP_RGB_ONE_MINUS_SRC_ALPHA,
+                            ctru::GPU_TEVOP_RGB_SRC_COLOR,
+                        );
+                    }
                 }
                 Env::Reflection => {
                     c3d::C3D_TexEnvSrc(
@@ -513,6 +782,79 @@ impl Gpu {
                 }
             }
             self.bound_textured = Some(mode);
+        }
+        if self.bound_effect != Some(state.effect) {
+            let env = c3d::C3D_GetTexEnv(1);
+            let tail = c3d::C3D_GetTexEnv(2);
+            // Every effect keeps the alpha computed in stage 0.
+            c3d::C3D_TexEnvInit(env);
+            c3d::C3D_TexEnvInit(tail);
+            match state.effect {
+                Effect::None => {}
+                Effect::Overlay(overlay) => {
+                    c3d::C3D_TexEnvSrc(
+                        env,
+                        c3d::C3D_RGB,
+                        ctru::GPU_CONSTANT,
+                        ctru::GPU_PREVIOUS,
+                        ctru::GPU_CONSTANT,
+                    );
+                    c3d::C3D_TexEnvOpRgb(
+                        env,
+                        ctru::GPU_TEVOP_RGB_SRC_COLOR,
+                        ctru::GPU_TEVOP_RGB_SRC_COLOR,
+                        ctru::GPU_TEVOP_RGB_SRC_ALPHA,
+                    );
+                    c3d::C3D_TexEnvFunc(env, c3d::C3D_RGB, ctru::GPU_INTERPOLATE);
+                    c3d::C3D_TexEnvColor(env, overlay);
+                }
+                Effect::Cloud(light) => {
+                    // Highlight × (1 − baked coverage) + the lit base.
+                    c3d::C3D_TexEnvSrc(
+                        env,
+                        c3d::C3D_RGB,
+                        ctru::GPU_CONSTANT,
+                        ctru::GPU_TEXTURE0,
+                        ctru::GPU_PREVIOUS,
+                    );
+                    c3d::C3D_TexEnvOpRgb(
+                        env,
+                        ctru::GPU_TEVOP_RGB_SRC_COLOR,
+                        ctru::GPU_TEVOP_RGB_ONE_MINUS_SRC_ALPHA,
+                        ctru::GPU_TEVOP_RGB_SRC_COLOR,
+                    );
+                    c3d::C3D_TexEnvFunc(env, c3d::C3D_RGB, ctru::GPU_MULTIPLY_ADD);
+                    c3d::C3D_TexEnvColor(env, light);
+                }
+                Effect::ShadowedCloud(light) => {
+                    c3d::C3D_TexEnvColor(c3d::C3D_GetTexEnv(0), light);
+                    // Stage 1 gates the rim with the per-texel exposure.
+                    c3d::C3D_TexEnvSrc(
+                        env,
+                        c3d::C3D_RGB,
+                        ctru::GPU_PREVIOUS,
+                        ctru::GPU_TEXTURE1,
+                        0,
+                    );
+                    c3d::C3D_TexEnvOpRgb(
+                        env,
+                        ctru::GPU_TEVOP_RGB_SRC_COLOR,
+                        ctru::GPU_TEVOP_RGB_SRC_ALPHA,
+                        ctru::GPU_TEVOP_RGB_SRC_COLOR,
+                    );
+                    c3d::C3D_TexEnvFunc(env, c3d::C3D_RGB, ctru::GPU_MODULATE);
+                    // Stage 2 adds the same ambient-lit base as ordinary clouds.
+                    c3d::C3D_TexEnvSrc(
+                        tail,
+                        c3d::C3D_RGB,
+                        ctru::GPU_TEXTURE0,
+                        ctru::GPU_PRIMARY_COLOR,
+                        ctru::GPU_PREVIOUS,
+                    );
+                    c3d::C3D_TexEnvFunc(tail, c3d::C3D_RGB, ctru::GPU_MULTIPLY_ADD);
+                }
+            }
+            self.bound_effect = Some(state.effect);
         }
         if let Some(p) = state.page {
             if self.bound_page != Some((p, state.smooth)) {
@@ -589,6 +931,7 @@ impl Gpu {
                 page: None,
                 additive: false,
                 smooth: false,
+                effect: Effect::None,
             },
             &solid,
         );
@@ -601,6 +944,7 @@ impl Gpu {
                     page: Some(p as u16),
                     additive: false,
                     smooth: false,
+                    effect: Effect::None,
                 },
                 &quads,
             );
@@ -630,15 +974,29 @@ impl Gpu {
         uv: [(f32, f32); 4],
         colors: [Color; 4],
     ) {
+        self.quad_with_shadow(state, corners, uv, colors, [[0; 2]; 4]);
+    }
+
+    fn quad_with_shadow(
+        &mut self,
+        state: State,
+        corners: [(f32, f32); 4],
+        uv: [(f32, f32); 4],
+        colors: [Color; 4],
+        shadow_uv: [[u16; 2]; 4],
+    ) {
         let z = -0.999 + self.order as f32 * Z_STEP;
         self.order += 1;
         let q: Quad = [0, 1, 2, 3].map(|i| Vertex {
             pos: [corners[i].0, corners[i].1, z, self.depth],
             uv: [uv[i].0, uv[i].1],
             color: color(colors[i]),
+            cloud_uv: shadow_uv[i],
         });
         let opaque = !self.painter
             && !state.additive
+            // Page-only opaque buckets cannot retain a per-sprite TEV constant.
+            && state.effect == Effect::None
             && colors.iter().all(|c| c.a >= 0.999)
             && state.page.is_none_or(|p| self.page_hard[p as usize]);
         if opaque {
@@ -666,35 +1024,52 @@ impl Gpu {
     fn sprite_part(&mut self, id: u32, at: (f32, f32), d: &Draw, tint: Color) {
         let s = *self.sheet.get(id);
         let (pw, ph) = self.page_size[s.page as usize];
-        let k = d.scale;
-        let px = if d.flip { s.w as f32 - s.px } else { s.px };
-        // Corners relative to the pivot, before rotation.
-        let (x0, y0) = (-px * k, -s.py * k);
-        let (x1, y1) = (x0 + s.w as f32 * k, y0 + s.h as f32 * k);
-        let rel = [(x0, y0), (x1, y0), (x1, y1), (x0, y1)];
-        let corners = if d.angle == 0.0 {
-            let mut c = rel.map(|(x, y)| (at.0 + x, at.1 + y));
-            if k == 1.0 {
-                for p in &mut c {
-                    *p = (p.0.round(), p.1.round());
-                }
-            }
-            c
-        } else {
-            let (sin, cos) = d.angle.sin_cos();
-            rel.map(|(x, y)| (at.0 + x * cos - y * sin, at.1 + x * sin + y * cos))
-        };
+        let corners = scene::render::sprite_corners(&s, at, d);
         // Texture v runs bottom-up.
         let (u0, u1) = (s.x as f32 / pw, (s.x + s.w) as f32 / pw);
         let (v0, v1) = (1.0 - s.y as f32 / ph, 1.0 - (s.y + s.h) as f32 / ph);
         let (ul, ur) = if d.flip { (u1, u0) } else { (u0, u1) };
-        let uv = [(ul, v0), (ur, v0), (ur, v1), (ul, v1)];
+        let (vt, vb) = if d.flip_y { (v1, v0) } else { (v0, v1) };
+        let uv = [(ul, vt), (ur, vt), (ur, vb), (ul, vb)];
+        let shadow = d.cloud_shadow.filter(|&[x, y]| {
+            self.cloud_exposure.is_some()
+                && x <= ATLAS_WIDTH.saturating_sub(s.w)
+                && y <= ATLAS_HEIGHT.saturating_sub(s.h)
+                && s.w <= ATLAS_WIDTH
+                && s.h <= ATLAS_HEIGHT
+        });
+        let effect = if let Some(light) = d.cloud_light {
+            let light = u32::from_le_bytes(color(light));
+            if shadow.is_some() {
+                Effect::ShadowedCloud(light)
+            } else {
+                Effect::Cloud(light)
+            }
+        } else if let Some(overlay) = d.overlay.filter(|c| c.a > 0.0) {
+            // The PowerSprite2 overlay follows recoloring and lighting.
+            Effect::Overlay(u32::from_le_bytes(color(overlay)))
+        } else {
+            Effect::None
+        };
         let state = State {
             page: Some(s.page),
-            additive: d.additive,
-            smooth: d.smooth && (d.scale != 1.0 || d.angle != 0.0),
+            additive: d.additive && d.cloud_light.is_none(),
+            effect,
+            smooth: d.smooth
+                && d.cloud_light.is_none()
+                && (d.scale != 1.0 || d.angle != 0.0 || d.affine != [1.0, 0.0, 0.0, 1.0]),
         };
-        self.quad(state, corners, uv, [tint; 4]);
+        let shadow_uv = shadow.map_or([[0; 2]; 4], |[x, y]| {
+            let (left, right) = if d.flip { (x + s.w, x) } else { (x, x + s.w) };
+            let (top, bottom) = (ATLAS_HEIGHT - y, ATLAS_HEIGHT - y - s.h);
+            let (top, bottom) = if d.flip_y {
+                (bottom, top)
+            } else {
+                (top, bottom)
+            };
+            [[left, top], [right, top], [right, bottom], [left, bottom]]
+        });
+        self.quad_with_shadow(state, corners, uv, [tint; 4], shadow_uv);
     }
 
     fn solid_rect(&mut self, r: Rect, top: Color, bottom: Color, additive: bool) {
@@ -708,12 +1083,29 @@ impl Gpu {
             page: None,
             additive,
             smooth: false,
+            effect: Effect::None,
         };
         self.quad(state, corners, [(0.0, 0.0); 4], [top, top, bottom, bottom]);
     }
 }
 
 impl Renderer for Gpu {
+    fn cloud_shadows(
+        &mut self,
+        camera: cloud_shadow::Camera,
+        clouds: &[cloud_shadow::Sprite],
+    ) -> bool {
+        let Some(tex) = &mut self.cloud_exposure else {
+            return false;
+        };
+        let Some(atlas) = self.cloud_shadow.prepare(camera, clouds) else {
+            return false;
+        };
+        // The frame's synchronous begin has finished GPU use of the old atlas.
+        unsafe { upload_cloud_exposure(tex.as_mut(), atlas) };
+        true
+    }
+
     fn clear(&mut self, c: Color) {
         // Painted rather than cleared so it sits at the back of this screen's order.
         self.solid_rect(Rect::new(0.0, 0.0, 400.0, 240.0), c, c, false);
@@ -722,6 +1114,9 @@ impl Renderer for Gpu {
     fn sprite(&mut self, id: u32, at: (f32, f32), d: Draw) {
         let masks = self.sheet.get(id).masks;
         self.sprite_part(id, at, &d, d.tint);
+        if d.cloud_light.is_some() {
+            return;
+        }
         // orig: Custom/PowerSprite2's recolour: keyed pixels × recolorA / recolorB.
         let (a, b) = d.recolor.unwrap_or((Color::WHITE, Color::WHITE));
         for (m, c) in masks.into_iter().zip([a, b]) {
@@ -751,6 +1146,7 @@ impl Renderer for Gpu {
             page: Some(s.page),
             additive: false,
             smooth: false,
+            effect: Effect::None,
         };
         for &(cx, cw, dx, dw) in &cols {
             for &(ry, rh, dy, dh) in &rows {
@@ -803,6 +1199,7 @@ impl Renderer for Gpu {
             page: None,
             additive: false,
             smooth: false,
+            effect: Effect::None,
         };
         for i in 0..N {
             let a0 = i as f32 / N as f32 * std::f32::consts::TAU;
@@ -822,6 +1219,7 @@ impl Renderer for Gpu {
             page: None,
             additive: false,
             smooth: false,
+            effect: Effect::None,
         };
         for i in 0..N {
             let a0 = i as f32 / N as f32 * std::f32::consts::TAU;
@@ -841,13 +1239,14 @@ impl Renderer for Gpu {
     }
 
     fn reflect(&mut self, dest: Rect, src: Rect, tint: Color) {
-        let Some(page) = self.reflection.filter(|_| self.reflection_ready) else {
+        let Some(pages) = self.reflection.filter(|_| self.reflection_ready[0]) else {
             return;
         };
         // The copy is the colour buffer as is: sideways, screen column x in
         // memory row x, counted (like texture rows) from v = 1 down, so the
         // 400 copied rows fill v 1..112/512. Screen (x, y) is at texel
         // (240 - y, 512 - x).
+        let page = pages[0];
         let mode = self.reflect_mode;
         let uv = |x: f32, y: f32| {
             let u = if mode & 1 == 0 { 240.0 - y } else { y };
@@ -865,6 +1264,7 @@ impl Renderer for Gpu {
             page: Some(page),
             additive: true,
             smooth: false,
+            effect: Effect::None,
         };
         self.quad(
             state,

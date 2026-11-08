@@ -770,11 +770,15 @@ mod tests {
                 scatter: 1, // scatterTree
             },
             parts: vec![Part {
+                reflection_only: false,
                 sprite: Some(0),
                 x: 0.0,
                 y: 0.0,
                 z: 0.0,
                 flip: false,
+                flip_y: false,
+                transform: Affine2::IDENTITY,
+                node: 0,
                 color: [255; 4],
                 sort_layer: 0,
                 sort_order: 0,
