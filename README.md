@@ -1,10 +1,10 @@
 <p align="center">
   <img src="banner/banner.webp"
-       alt="Kingdom: New Lands pixel art landscape"
-       width="100%">
+       alt="A mounted monarch rides beneath a red moon and through forest mist, with rippling reflections in the water."
+       width="800">
 </p>
 
-*Gameplay captured from the Rust reimplementation of Kingdom: New Lands.*
+*Red-moon clouds, forest fog, and water reflections. Captured from this fork’s desktop build at the 3DS top screen’s native 400 × 240 resolution.*
 
 # Kingdom: New Lands for Nintendo 3DS
 
