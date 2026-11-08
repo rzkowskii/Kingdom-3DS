@@ -384,21 +384,23 @@ impl Assets {
         mesh: Option<&cloud_mesh::CloudMesh>,
         at: (f32, f32),
         d: &Draw,
+        vertex_tints: Option<&[Color]>,
     ) {
         let sprite = self.sheet.get(id);
         let geometry = Geometry::new(sprite, mesh);
         let texture = &self.pages[usize::from(sprite.page)];
         let shadow = self.shadow_camera.zip(d.cloud_shadow);
-        let color = mc(d.tint);
         let vertices = geometry
             .vertices()
             .iter()
-            .map(|&local| {
+            .enumerate()
+            .map(|(i, &local)| {
                 let [x, y] = cloud_shadow::screen_point(local, at, d);
                 // Keep the original UV attached to its vertex when mirroring.
                 let u = (f32::from(sprite.x) + sprite.px + local[0]) / texture.width();
                 let v = (f32::from(sprite.y) + sprite.py + local[1]) / texture.height();
-                let mut vertex = Vertex::new(x, y, 0.0, u, v, color);
+                let tint = vertex_tints.map_or(d.tint, |tints| tints[i]);
+                let mut vertex = Vertex::new(x, y, 0.0, u, v, mc(tint));
                 if let Some((camera, receiver)) = shadow {
                     let scale = [d.affine[0] * d.scale, d.affine[3] * d.scale];
                     let [x, y, z] =
@@ -469,7 +471,7 @@ impl Renderer for Assets {
 
     fn sprite(&mut self, id: u32, at: (f32, f32), d: Draw) {
         if d.cloud_light.is_some() {
-            self.indexed_sprite(id, self.sheet.cloud_mesh(id), at, &d);
+            self.indexed_sprite(id, self.sheet.cloud_mesh(id), at, &d, None);
             return;
         }
         let s = *self.sheet.get(id);
@@ -539,8 +541,9 @@ impl Renderer for Assets {
         mesh: &cloud_mesh::CloudMesh,
         at: (f32, f32),
         d: Draw,
+        vertex_tints: Option<&[Color]>,
     ) {
-        self.indexed_sprite(id, Some(mesh), at, &d);
+        self.indexed_sprite(id, Some(mesh), at, &d, vertex_tints);
     }
 
     /// orig: `Image.Type.Sliced`.

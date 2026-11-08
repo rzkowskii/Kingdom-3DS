@@ -24,8 +24,9 @@ discards fragments below 0.01 coverage. The source fog textures have binary
 alpha, so the port can reject the whole draw below that threshold. Mist's
 `Ambient Only` shader multiplies both RGB and alpha by ambient light. The port
 uses ordinary source-alpha blending for both. Fog uses the ambient part of
-`Pow-Diffuse` and the shared scene sort. The PC can add local light passes to
-fog and writes its translucent depth.
+`Pow-Diffuse` and the shared scene sort in P12. P13 adds the local light
+calculation inside the PC's single pass and enables fog depth writes on 3DS.
+[Fog lighting and depth notes](p13-fog-lighting.md)
 
 The optional `atmosphere.bin` stores both authored controllers and their seven
 meshes. It uses a separate sprite table, so the v8 world file and existing

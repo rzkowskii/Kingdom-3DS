@@ -74,6 +74,8 @@ pub struct Draw {
     /// Receiver pose and index in the prepared cloud shadow pass.
     pub cloud_shadow: Option<crate::cloud_shadow::Receiver>,
     pub additive: bool,
+    /// Write depth while blending covered fragments, as on the PC fog material.
+    pub depth_write: bool,
     /// Filtered smoothly when scaled (glows); everything else stays pixel-sharp.
     pub smooth: bool,
 }
@@ -92,6 +94,7 @@ impl Draw {
             cloud_light: None,
             cloud_shadow: None,
             additive: false,
+            depth_write: false,
             smooth: false,
         }
     }
@@ -140,6 +143,11 @@ impl Draw {
 
     pub fn additive(mut self) -> Draw {
         self.additive = true;
+        self
+    }
+
+    pub fn depth_write(mut self) -> Draw {
+        self.depth_write = true;
         self
     }
 
@@ -199,13 +207,15 @@ pub trait Renderer {
     fn clear(&mut self, c: Color);
     /// Sprite `id` (in the backend's `Sheet`) with its pivot at `at`.
     fn sprite(&mut self, id: u32, at: (f32, f32), d: Draw);
-    /// A fog or mist sprite using its authored geometry and ordinary material.
+    /// Fog or mist using its authored geometry. Local lighting, when present,
+    /// supplies one tint per mesh vertex with the same coverage as `d.tint`.
     fn atmosphere_sprite(
         &mut self,
         id: u32,
         _mesh: &crate::cloud_mesh::CloudMesh,
         at: (f32, f32),
         d: Draw,
+        _vertex_tints: Option<&[Color]>,
     ) {
         self.sprite(id, at, d);
     }
@@ -242,6 +252,10 @@ pub trait Renderer {
     /// Stereo depth of what's drawn next: 0 at the screen, 1 farthest
     /// behind it, negative in front. Backends without 3D ignore it.
     fn depth(&mut self, _d: f32) {}
+    /// Raster depth in Unity world units, independent of submission order and
+    /// stereo disparity. Larger Z is farther away. Negative infinity puts
+    /// screen overlays in front of the world.
+    fn world_depth(&mut self, _z: f32) {}
 }
 
 #[cfg(test)]

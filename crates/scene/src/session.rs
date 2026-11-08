@@ -92,6 +92,7 @@ pub struct Session {
     pub boulder_particles: crate::boulder_fx::BoulderParticles,
     pub clouds: crate::clouds::Clouds,
     pub atmosphere: Option<crate::atmosphere_data::AtmosphereDef>,
+    pub(crate) fires: crate::fires::Fires,
     stars: Stars,
     pub bag_bounce: f32,
     pub day_banner: Option<(u32, f32)>,
@@ -282,6 +283,7 @@ impl Session {
             boulder_particles: Default::default(),
             clouds: crate::clouds::Clouds::new(seed, camera_x),
             atmosphere: None,
+            fires: crate::fires::Fires::new(seed),
             stars: Stars::default(),
             bag_bounce: 0.0,
             day_banner: None,
@@ -331,7 +333,9 @@ impl Session {
         self.water_camera = self.camera_x;
         self.boulder_particles = Default::default();
         // Loader reloads the scene, including both cloud controllers and wind.
-        self.clouds = crate::clouds::Clouds::new(self.game.rng.clone().next_u32(), self.camera_x);
+        let scene_seed = self.game.rng.clone().next_u32();
+        self.clouds = crate::clouds::Clouds::new(scene_seed, self.camera_x);
+        self.fires = crate::fires::Fires::new(scene_seed);
         self.music_cues.clear();
     }
 
@@ -730,6 +734,7 @@ impl Session {
         self.camera_x = self.camera.position();
         self.boulder_particles = Default::default();
         self.clouds = crate::clouds::Clouds::new(seed, self.camera_x);
+        self.fires = crate::fires::Fires::new(seed);
         self.stars = Stars::default();
         self.won_for = 0.0;
         // orig: UnlockManager.Restore → AutoSave.
@@ -771,6 +776,7 @@ impl Session {
             raw.bag_tap = false;
             self.events.clear();
             self.game.tick(&self.world, &controls, &mut self.events);
+            self.fires.step(&self.world, &self.game);
             self.boulder_particles.advance(TICK);
             self.stars
                 .step(self.game.blender.state.floats[game::lighting::float::STARS]);

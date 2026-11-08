@@ -1,16 +1,18 @@
 //! The 3DS renderer: citro3d with one vertex shader, drawing the scene as
 //! textured quads (like citro2d does in C).
 //!
-//! The scene arrives back to front. Changing texture pages costs a draw call,
-//! and in painter's order neighbouring sprites are usually on different
-//! pages, so instead each item gets a depth from its place in the order:
+//! Changing texture pages costs a draw call. Before the first fog draw,
+//! items get a depth from their place in painter's order:
 //!
 //! - Opaque items (sprites on the 1-bit-alpha pages with a full-alpha tint,
 //!   and solid fills) are drawn grouped by page, one call each, with the
 //!   depth test keeping them in order and the alpha test cutting out clear
 //!   pixels.
-//! - Everything else (soft-edged sprites, fades, haze, glows) follows in
-//!   painter's order, tested against that depth but not writing it.
+//! - Translucent items follow in painter's order and test against depth.
+//!
+//! Fog and later items stay in submission order and use a separate depth
+//! range for world Z. Fog writes covered depth so a later sorting layer or
+//! order can still be occluded by nearer fog.
 //!
 //! With the debug overlay enabled, X switches to plain painter's order.
 //!
@@ -43,6 +45,16 @@ const _: () = assert!(ATLAS_WIDTH == 1024 && ATLAS_HEIGHT == 1024);
 const MAX_QUADS: usize = 16384;
 /// Depth step between items in painter's order (24-bit depth buffer).
 const Z_STEP: f32 = 1.5e-5;
+const DRAW_ORDER_LIMIT: f32 = -0.75;
+
+/// The world-depth range sits entirely in front of the batched prefix.
+/// Keep equality for coplanar sprites and leave room for screen overlays.
+fn world_raster_z(z: f32) -> f32 {
+    if z == f32::NEG_INFINITY {
+        return 0.0;
+    }
+    -0.45 - 0.2 * (z / (z.abs() + 10.0))
+}
 /// The top screen's colour buffer: 240 x 400 (mounted sideways), RGBA8,
 /// in rows of 8x8 tiles. The reflection texture is 256 x 512.
 const TOP_TILE_ROW: u32 = 30 * 8 * 8 * 4;
@@ -57,7 +69,7 @@ const GX_CMDLIST_FLUSH: u8 = 1 << 1;
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct Vertex {
-    /// x, y, draw order and stereo depth.
+    /// x, y, raster depth and stereo depth.
     pos: [f32; 4],
     uv: [f32; 2],
     color: [u8; 4],
@@ -76,6 +88,41 @@ struct State {
     /// Linear filtering (scaled glows).
     smooth: bool,
     effect: Effect,
+    depth: DepthMode,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DepthMode {
+    Read,
+    Opaque,
+    WorldRead,
+    Fog,
+}
+
+impl DepthMode {
+    fn sprite(draw: &Draw) -> Self {
+        if draw.depth_write {
+            Self::Fog
+        } else {
+            Self::Read
+        }
+    }
+
+    fn tests(self, painter: bool) -> (ctru::GPU_TESTFUNC, ctru::GPU_WRITEMASK, i32) {
+        let (test, write, min_alpha) = match self {
+            Self::Read => (ctru::GPU_GREATER, ctru::GPU_WRITE_COLOR, 1),
+            Self::Opaque => (ctru::GPU_GREATER, ctru::GPU_WRITE_ALL, 1),
+            Self::WorldRead => (ctru::GPU_GEQUAL, ctru::GPU_WRITE_COLOR, 1),
+            // The 3DS uses reversed Z, so the PC material's LEqual is GEQUAL.
+            // Its .01 cutoff first passes at alpha 3/255.
+            Self::Fog => (ctru::GPU_GEQUAL, ctru::GPU_WRITE_ALL, 3),
+        };
+        if painter {
+            (ctru::GPU_ALWAYS, ctru::GPU_WRITE_COLOR, min_alpha)
+        } else {
+            (test, write, min_alpha)
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -95,13 +142,9 @@ enum RightCloudExposure {
     Unavailable,
 }
 
-/// A step of a screen's drawing, kept to replay for the right eye.
+/// A run's complete state and vertex range, kept to replay for the right eye.
 #[derive(Clone, Copy)]
-enum Call {
-    /// Depth test for the opaque pass (`true`) or the translucent one.
-    Pass(bool),
-    Draw(State, usize, usize),
-}
+struct Call(State, usize, usize);
 
 pub struct Screen {
     target: *mut c3d::C3D_RenderTarget,
@@ -120,6 +163,8 @@ pub struct Gpu {
     pub stereo: f32,
     /// Depth given to quads from here on (see `Renderer::depth`).
     depth: f32,
+    /// Raster Z after entering the ordered world-depth range.
+    world_z: Option<f32>,
     calls: Vec<Call>,
     pages: Vec<Box<c3d::C3D_Tex>>,
     page_size: Vec<(f32, f32)>,
@@ -148,6 +193,7 @@ pub struct Gpu {
     bound_textured: Option<Env>,
     bound_effect: Option<Effect>,
     bound_additive: Option<bool>,
+    bound_depth: Option<DepthMode>,
     /// Draw calls this frame.
     pub draws: u32,
     /// The page holding last frame's top screen, once one has been copied.
@@ -476,6 +522,7 @@ impl Gpu {
                 eye_loc,
                 stereo: 0.0,
                 depth: 0.0,
+                world_z: None,
                 calls: Vec::new(),
                 pages,
                 page_size,
@@ -496,6 +543,7 @@ impl Gpu {
                 bound_textured: None,
                 bound_effect: None,
                 bound_additive: None,
+                bound_depth: None,
                 draws: 0,
                 reflection,
                 reflection_ready: [false; 2],
@@ -527,8 +575,6 @@ impl Gpu {
                 0x3210,
             );
             c3d::C3D_CullFace(ctru::GPU_CULL_NONE);
-            // Clear pixels never count.
-            c3d::C3D_AlphaTest(true, ctru::GPU_GREATER, 0);
         }
         self.quads = 0;
         self.draws = 0;
@@ -540,6 +586,7 @@ impl Gpu {
         self.bound_textured = None;
         self.bound_effect = None;
         self.bound_additive = None;
+        self.bound_depth = None;
     }
 
     /// Vertices queued this frame.
@@ -555,6 +602,7 @@ impl Gpu {
         }
         self.on_top = top;
         self.depth = 0.0;
+        self.world_z = None;
         let s = if top { &self.top } else { &self.bottom };
         unsafe {
             c3d::C3D_RenderTargetClear(s.target, c3d::C3D_CLEAR_ALL, clear_color(Color::BLACK), 0);
@@ -600,50 +648,33 @@ impl Gpu {
                 false
             };
         self.unbind();
-        for &c in &calls {
-            match c {
-                Call::Pass(opaque) => self.depth_test(opaque),
-                Call::Draw(mut state, first, n) => unsafe {
-                    if let (Some(page), Some(pages)) = (state.page, self.reflection) {
-                        let Some(page) = scene::render::reflection_page_for_right(
-                            page,
-                            pages,
-                            self.reflection_ready[1],
-                        ) else {
-                            continue;
-                        };
-                        state.page = Some(page);
-                    }
-                    if !has_exposure {
-                        if let Effect::ShadowedCloud(light) = state.effect {
-                            state.effect = Effect::Cloud(light);
-                        }
-                    }
-                    self.bind(state);
-                    c3d::C3D_DrawElements(
-                        ctru::GPU_TRIANGLES,
-                        (n * 6) as i32,
-                        c3d::C3D_UNSIGNED_SHORT as i32,
-                        self.indices.add(first * 6) as *const _,
-                    );
-                    self.draws += 1;
-                },
+        for &Call(mut state, first, n) in &calls {
+            if let (Some(page), Some(pages)) = (state.page, self.reflection) {
+                let Some(page) =
+                    scene::render::reflection_page_for_right(page, pages, self.reflection_ready[1])
+                else {
+                    continue;
+                };
+                state.page = Some(page);
             }
+            if !has_exposure {
+                if let Effect::ShadowedCloud(light) = state.effect {
+                    state.effect = Effect::Cloud(light);
+                }
+            }
+            unsafe {
+                self.bind(state);
+                c3d::C3D_DrawElements(
+                    ctru::GPU_TRIANGLES,
+                    (n * 6) as i32,
+                    c3d::C3D_UNSIGNED_SHORT as i32,
+                    self.indices.add(first * 6) as *const _,
+                );
+            }
+            self.draws += 1;
         }
         self.calls = calls;
         self.unbind();
-    }
-
-    fn depth_test(&mut self, opaque: bool) {
-        unsafe {
-            if self.painter {
-                c3d::C3D_DepthTest(false, ctru::GPU_ALWAYS, ctru::GPU_WRITE_COLOR);
-            } else if opaque {
-                c3d::C3D_DepthTest(true, ctru::GPU_GREATER, ctru::GPU_WRITE_ALL);
-            } else {
-                c3d::C3D_DepthTest(true, ctru::GPU_GREATER, ctru::GPU_WRITE_COLOR);
-            }
-        }
     }
 
     fn submit_before_copy(&self) {
@@ -709,6 +740,7 @@ impl Gpu {
                 c3d::C3D_FVUnifSet(ctru::GPU_VERTEX_SHADER, self.eye_loc, shift, 0.0, 0.0, 0.0);
             }
             self.depth = 0.0;
+            self.world_z = None;
             self.unbind();
             extras(self);
             self.flush();
@@ -757,6 +789,12 @@ impl Gpu {
 
     /// Sets the GPU up for `state` (only what changed).
     unsafe fn bind(&mut self, state: State) {
+        if self.bound_depth != Some(state.depth) {
+            let (test, write, min_alpha) = state.depth.tests(self.painter);
+            c3d::C3D_DepthTest(!self.painter, test, write);
+            c3d::C3D_AlphaTest(true, ctru::GPU_GEQUAL, min_alpha);
+            self.bound_depth = Some(state.depth);
+        }
         let mode = match state.page {
             None => Env::Solid,
             Some(p) if self.reflection.is_some_and(|pages| pages.contains(&p)) => Env::Reflection,
@@ -946,14 +984,12 @@ impl Gpu {
             );
         }
         self.draws += 1;
-        self.calls.push(Call::Draw(state, first, n));
+        self.calls.push(Call(state, first, n));
     }
 
     /// Draws this screen's items: the opaque pass by page, then the rest in order.
     fn flush(&mut self) {
         self.calls.clear();
-        self.depth_test(true);
-        self.calls.push(Call::Pass(true));
         let solid = std::mem::take(&mut self.solid);
         self.draw(
             State {
@@ -961,6 +997,7 @@ impl Gpu {
                 additive: false,
                 smooth: false,
                 effect: Effect::None,
+                depth: DepthMode::Opaque,
             },
             &solid,
         );
@@ -974,15 +1011,13 @@ impl Gpu {
                     additive: false,
                     smooth: false,
                     effect: Effect::None,
+                    depth: DepthMode::Opaque,
                 },
                 &quads,
             );
             self.opaque[p] = quads;
             self.opaque[p].clear();
         }
-        // The translucent rest: tested against the opaque pass, not written.
-        self.depth_test(false);
-        self.calls.push(Call::Pass(false));
         let runs = std::mem::take(&mut self.runs);
         for &(state, first, n) in &runs {
             self.draw_range(state, first, n);
@@ -998,13 +1033,12 @@ impl Gpu {
     /// Queues a quad (corners clockwise from top-left) in its pass.
     fn quad(
         &mut self,
-        state: State,
+        mut state: State,
         corners: [(f32, f32); 4],
         uv: [(f32, f32); 4],
         colors: [Color; 4],
     ) {
-        let z = -0.999 + self.order as f32 * Z_STEP;
-        self.order += 1;
+        let z = self.next_raster_z(&mut state.depth);
         let q: Quad = [0, 1, 2, 3].map(|i| Vertex {
             pos: [corners[i].0, corners[i].1, z, self.depth],
             uv: [uv[i].0, uv[i].1],
@@ -1013,6 +1047,7 @@ impl Gpu {
         });
         let opaque = !self.painter
             && !state.additive
+            && state.depth == DepthMode::Read
             // Page-only opaque buckets cannot retain a per-sprite TEV constant.
             && state.effect == Effect::None
             && colors.iter().all(|c| c.a >= 0.999)
@@ -1025,6 +1060,18 @@ impl Gpu {
             return;
         }
         self.translucent_quad(state, q);
+    }
+
+    fn next_raster_z(&mut self, mode: &mut DepthMode) -> f32 {
+        if let Some(z) = self.world_z {
+            if *mode == DepthMode::Read {
+                *mode = DepthMode::WorldRead;
+            }
+            return z;
+        }
+        let z = (-0.999 + self.order as f32 * Z_STEP).min(DRAW_ORDER_LIMIT);
+        self.order += 1;
+        z
     }
 
     fn translucent_quad(&mut self, state: State, q: Quad) {
@@ -1043,13 +1090,18 @@ impl Gpu {
     }
 
     /// Unity's tight sprite triangles, with an exposure mask for cloud receivers.
-    fn indexed_sprite(&mut self, id: u32, mesh: Option<&CloudMesh>, at: (f32, f32), d: &Draw) {
+    fn indexed_sprite(
+        &mut self,
+        id: u32,
+        mesh: Option<&CloudMesh>,
+        at: (f32, f32),
+        d: &Draw,
+        vertex_tints: Option<&[Color]>,
+    ) {
         let sheet = Rc::clone(&self.sheet);
         let s = sheet.get(id);
         let geometry = cloud_shadow::Geometry::new(s, mesh.or_else(|| sheet.cloud_mesh(id)));
         let triangles = geometry.indices().as_chunks::<3>().0;
-        let z = -0.999 + self.order as f32 * Z_STEP;
-        self.order += 1;
         if triangles.len() > MAX_QUADS - self.quads {
             return;
         }
@@ -1066,10 +1118,11 @@ impl Gpu {
                 mask.tile[1] as i16 - mask.origin[1] - ATLAS_HEIGHT as i16,
             ]
         });
-        let state = State {
+        let mut state = State {
             page: Some(s.page),
             additive: d.cloud_light.is_none() && d.additive,
             smooth: false,
+            depth: DepthMode::sprite(d),
             effect: d.cloud_light.map_or(Effect::None, |light| {
                 let light = u32::from_le_bytes(color(light));
                 if mask.is_some() {
@@ -1079,11 +1132,13 @@ impl Gpu {
                 }
             }),
         };
+        let z = self.next_raster_z(&mut state.depth);
         let (pw, ph) = self.page_size[s.page as usize];
         let depth = self.depth;
         let tint = color(d.tint);
         let vertex = |index: u16| {
-            let local = geometry.vertices()[usize::from(index)];
+            let index = usize::from(index);
+            let local = geometry.vertices()[index];
             let [x, y] = cloud_shadow::screen_point(local, at, d);
             Vertex {
                 pos: [x, y, z, depth],
@@ -1091,7 +1146,9 @@ impl Gpu {
                     (f32::from(s.x) + s.px + local[0]) / pw,
                     1.0 - (f32::from(s.y) + s.py + local[1]) / ph,
                 ],
-                color: tint,
+                color: vertex_tints
+                    .and_then(|tints| tints.get(index))
+                    .map_or(tint, |&c| color(c)),
                 cloud_uv,
             }
         };
@@ -1123,6 +1180,7 @@ impl Gpu {
             page: Some(s.page),
             additive: d.additive,
             effect,
+            depth: DepthMode::sprite(d),
             smooth: d.smooth
                 && (d.scale != 1.0 || d.angle != 0.0 || d.affine != [1.0, 0.0, 0.0, 1.0]),
         };
@@ -1141,6 +1199,7 @@ impl Gpu {
             additive,
             smooth: false,
             effect: Effect::None,
+            depth: DepthMode::Read,
         };
         self.quad(state, corners, [(0.0, 0.0); 4], [top, top, bottom, bottom]);
     }
@@ -1189,7 +1248,7 @@ impl Renderer for Gpu {
 
     fn sprite(&mut self, id: u32, at: (f32, f32), d: Draw) {
         if d.cloud_light.is_some() {
-            self.indexed_sprite(id, None, at, &d);
+            self.indexed_sprite(id, None, at, &d, None);
             return;
         }
         let masks = self.sheet.get(id).masks;
@@ -1204,8 +1263,15 @@ impl Renderer for Gpu {
         }
     }
 
-    fn atmosphere_sprite(&mut self, id: u32, mesh: &CloudMesh, at: (f32, f32), d: Draw) {
-        self.indexed_sprite(id, Some(mesh), at, &d);
+    fn atmosphere_sprite(
+        &mut self,
+        id: u32,
+        mesh: &CloudMesh,
+        at: (f32, f32),
+        d: Draw,
+        vertex_tints: Option<&[Color]>,
+    ) {
+        self.indexed_sprite(id, Some(mesh), at, &d, vertex_tints);
     }
 
     fn sliced(&mut self, id: u32, dest: Rect, border: (f32, f32, f32, f32), tint: Color) {
@@ -1228,6 +1294,7 @@ impl Renderer for Gpu {
             additive: false,
             smooth: false,
             effect: Effect::None,
+            depth: DepthMode::Read,
         };
         for &(cx, cw, dx, dw) in &cols {
             for &(ry, rh, dy, dh) in &rows {
@@ -1281,6 +1348,7 @@ impl Renderer for Gpu {
             additive: false,
             smooth: false,
             effect: Effect::None,
+            depth: DepthMode::Read,
         };
         for i in 0..N {
             let a0 = i as f32 / N as f32 * std::f32::consts::TAU;
@@ -1301,6 +1369,7 @@ impl Renderer for Gpu {
             additive: false,
             smooth: false,
             effect: Effect::None,
+            depth: DepthMode::Read,
         };
         for i in 0..N {
             let a0 = i as f32 / N as f32 * std::f32::consts::TAU;
@@ -1317,6 +1386,10 @@ impl Renderer for Gpu {
 
     fn depth(&mut self, d: f32) {
         self.depth = d;
+    }
+
+    fn world_depth(&mut self, z: f32) {
+        self.world_z = Some(world_raster_z(z));
     }
 
     fn reflect(&mut self, dest: Rect, src: Rect, tint: Color) {
@@ -1346,6 +1419,7 @@ impl Renderer for Gpu {
             additive: true,
             smooth: false,
             effect: Effect::None,
+            depth: DepthMode::Read,
         };
         self.quad(
             state,
@@ -1353,5 +1427,46 @@ impl Renderer for Gpu {
             [uv(x0, y0), uv(x1, y0), uv(x1, y1), uv(x0, y1)],
             [tint; 4],
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ctru, world_raster_z, Color, DepthMode, Draw, DRAW_ORDER_LIMIT};
+
+    #[test]
+    fn fog_writes_depth_only_after_cutout() {
+        let fog = DepthMode::sprite(&Draw::tint(Color::WHITE).depth_write());
+        assert_eq!(fog.tests(false), (ctru::GPU_GEQUAL, ctru::GPU_WRITE_ALL, 3));
+        assert_eq!(
+            fog.tests(true),
+            (ctru::GPU_ALWAYS, ctru::GPU_WRITE_COLOR, 3)
+        );
+    }
+
+    #[test]
+    fn mist_and_opaque_keep_their_own_depth_and_alpha_tests() {
+        let mist = DepthMode::sprite(&Draw::tint(Color::WHITE));
+        assert_eq!(
+            mist.tests(false),
+            (ctru::GPU_GREATER, ctru::GPU_WRITE_COLOR, 1)
+        );
+        assert_eq!(
+            DepthMode::Opaque.tests(false),
+            (ctru::GPU_GREATER, ctru::GPU_WRITE_ALL, 1)
+        );
+        assert_eq!(
+            DepthMode::WorldRead.tests(false),
+            (ctru::GPU_GEQUAL, ctru::GPU_WRITE_COLOR, 1)
+        );
+    }
+
+    #[test]
+    fn world_raster_depth_is_reversed_and_separate_from_the_batched_prefix() {
+        let fog = world_raster_z(-4.0);
+        assert!(world_raster_z(64.0) > DRAW_ORDER_LIMIT);
+        assert!(world_raster_z(2.0) < fog);
+        assert!(world_raster_z(-5.0) > fog);
+        assert!(world_raster_z(f32::NEG_INFINITY) > world_raster_z(-10.0));
     }
 }

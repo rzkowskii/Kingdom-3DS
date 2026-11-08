@@ -11,6 +11,7 @@ use game::units::{Anim, ShieldStatus};
 
 use crate::cloud_shadow;
 use crate::clouds::{AtmosphereKind, AtmosphereSample, CloudKind, CloudSample};
+use crate::fires::FireSample;
 use crate::heraldry;
 use crate::render::{Color, Draw, Rect, Renderer};
 use crate::session::Session;
@@ -64,6 +65,37 @@ struct PointLight {
     range: f32,
     /// Light colour × intensity, faded in with the dark.
     color: [f32; 3],
+}
+
+/// One entry of the PC LightFaker position/intensity array, in scene units.
+/// X is relative to the camera, like the fog vertices it lights.
+#[derive(Clone, Copy)]
+struct FogLight {
+    position: [f32; 3],
+    intensity: f32,
+}
+
+struct FireItem {
+    position: [f32; 3],
+    ratio: f32,
+    def: FireDef,
+    sample: FireSample,
+}
+
+impl FireItem {
+    fn screen_position(&self, s: &Session) -> (f32, f32) {
+        layer_to_screen(s, self.position[0], self.position[1], self.ratio)
+    }
+
+    fn fog_light(&self, camera_x: f32, strength: f32, intensity: f32) -> FogLight {
+        let [x, y, z] = self.position;
+        // Fire.SlowUpdate evaluates Fire.prefab's clamped linear zCurve.
+        let offset_z = -0.25 - 2.75 * strength.clamp(0.0, 1.0);
+        FogLight {
+            position: [x - self.ratio * camera_x, y, z + offset_z],
+            intensity,
+        }
+    }
 }
 
 impl<R: Renderer> Ctx<'_, R> {
@@ -319,7 +351,7 @@ struct AtmosphereDraw<'a> {
     id: u32,
     mesh: &'a crate::cloud_mesh::CloudMesh,
     at: (f32, f32),
-    z: f32,
+    sample: AtmosphereSample,
     draw: Draw,
 }
 
@@ -472,7 +504,7 @@ fn draw_list_with_effects(
         items.push(((0, 0, -cloud.sample.position[2]), DrawItem::Cloud(i)));
     }
     for (i, cloud) in atmosphere.iter().enumerate() {
-        items.push(((0, 0, -cloud.z), DrawItem::Atmosphere(i)));
+        items.push(((0, 0, -cloud.sample.position[2]), DrawItem::Atmosphere(i)));
     }
     for i in 0..g.greed.bolts.len() {
         items.push(((0, 0, -0.7), DrawItem::Bolt(i)));
@@ -501,8 +533,11 @@ fn draw_list_with_effects(
         }
     }
     items.push(((0, 0, -MONARCH_Z), DrawItem::Monarch));
-    if torch_lit(s) {
-        items.push(((0, 0, -(MONARCH_Z - 0.01)), DrawItem::Torch));
+    if let Some(torch) = world.steeds[g.steed as usize]
+        .torch
+        .filter(|_| s.fires.torch().is_some())
+    {
+        items.push(((0, 0, -torch_z(&torch)), DrawItem::Torch));
     }
     for (i, u) in g.population.units.iter().enumerate() {
         if (u.x - cam).abs() < view {
@@ -526,8 +561,16 @@ fn draw_list_with_effects(
             items.push(((0, 0, -1.4), DrawItem::Tool(i)));
         }
     }
-    // Coin indicators float in front of the scene.
-    items.push(((0, 0, f32::INFINITY), DrawItem::PriceSlots));
+    if let Some(o) = g
+        .pay
+        .selected()
+        .and_then(|id| level.index_of(id.0))
+        .map(|i| &level.objects[i])
+    {
+        // Payable.AddCoinIndicators parents these just ahead of the payable.
+        let z = world.layer(o.layer).z + o.z - 0.005;
+        items.push(((0, 0, -z), DrawItem::PriceSlots));
+    }
     items.push(((0, 0, -FILL.0), DrawItem::Fill));
     items.push(((0, 0, -HAZE_FAR.0), DrawItem::HazeFar));
     items.push(((0, 0, -HAZE_NEAR.0), DrawItem::HazeNear));
@@ -617,11 +660,7 @@ pub fn draw_reflection_extras<R: Renderer>(s: &Session, sheet: &Sheet, r: &mut R
     if items.is_empty() {
         return;
     }
-    let lights = draw_list(s)
-        .iter()
-        .filter_map(|(_, item)| fire_item(s, item))
-        .filter_map(|(at, fire, seed)| fire_light(s, at, &fire, seed))
-        .collect();
+    let (lights, _) = fire_lights(s, &draw_list(s), false);
     let mut c = Ctx {
         s,
         sheet,
@@ -639,20 +678,7 @@ pub fn draw_reflection_extras<R: Renderer>(s: &Session, sheet: &Sheet, r: &mut R
     }
 }
 
-/// Whether fire `f` burns now. orig: `Fire.Start` / `HandleOnDayEnd`:
-/// night-only fires burn from dusk to dawn; ones that don't start
-/// themselves (the statues') stay out.
-fn burning(s: &Session, f: &FireDef) -> bool {
-    f.auto_start && (!f.night_only || !s.game.days.is_daytime)
-}
-
-/// orig: `Player.Update`: the torch is lit when the ambient light is dim.
-fn torch_lit(s: &Session) -> bool {
-    s.world.steeds[s.game.steed as usize].torch.is_some()
-        && s.game.blender.state.ambient_grayscale() < s.world.fire.torch_threshold
-}
-
-/// Draw items for an object's burning fires, above its own parts.
+/// Flame renderers use the default sorting layer and order at the attachment.
 fn push_fires(
     items: &mut Vec<((i16, i16, f32), DrawItem)>,
     s: &Session,
@@ -665,57 +691,54 @@ fn push_fires(
         return;
     }
     let layer = s.world.layer(o.layer);
-    let top = proto.parts.iter().map(|p| p.sort_layer).max().unwrap_or(0);
     for (f, fire) in proto.fires.iter().enumerate() {
-        if burning(s, fire) {
+        if s.fires.object(o, f, scenery).is_some() {
             let z = layer.z + o.z + fire.at.2;
-            items.push(((top, i16::MAX, -z), DrawItem::Fire { o: oi, f, scenery }));
+            items.push(((0, 0, -z), DrawItem::Fire { o: oi, f, scenery }));
         }
     }
-}
-
-/// A fire's strength, current intensity (flickering) and how far its light
-/// shows (1 in the dark, 0 by day). orig: `Fire.SlowUpdate`: intensity from
-/// strength, flickering by up to ±0.3 in the dark.
-fn fire_intensity(s: &Session, fire: &FireDef, seed: u32) -> (f32, f32, f32) {
-    let st = &s.world.fire;
-    let size = (fire.size.0 * fire.size.0 + fire.size.1 * fire.size.1).sqrt();
-    let strength = sample_keys(&st.strength, size);
-    let dark = sample_keys(&st.ambient, s.game.blender.state.ambient_grayscale());
-    // A smooth random flicker, stepping every 0.15 s like the original.
-    let k = s.t / 0.15 + seed as f32 * 0.37;
-    let noise = |i: f32| {
-        let h = ((i as u32).wrapping_mul(0x9E37_79B9) ^ seed.wrapping_mul(0x85EB_CA6B)) >> 9;
-        h as f32 / (1u32 << 23) as f32 * 2.0 - 1.0
-    };
-    let flicker = noise(k.floor()) + (noise(k.floor() + 1.0) - noise(k.floor())) * k.fract();
-    (
-        strength,
-        sample_keys(&st.intensity, strength) + flicker * 0.3 * dark,
-        dark,
-    )
 }
 
 /// A fire's point light. Every fire gets one, as on the PC's high quality
 /// (`FirePlaceholder`: `useRealLight = forceRealLight || highQuality`); the
 /// low-quality glow sprite washed the night sky and water warm grey.
-fn fire_light(s: &Session, at: (f32, f32), fire: &FireDef, seed: u32) -> Option<PointLight> {
+fn fire_lights(
+    s: &Session,
+    items: &[((i16, i16, f32), DrawItem)],
+    has_fog: bool,
+) -> (Vec<PointLight>, Vec<FogLight>) {
+    const LIGHT_FAKER_SLOTS: usize = 50;
     let st = &s.world.fire;
-    let (strength, intensity, dark) = fire_intensity(s, fire, seed);
-    let k = intensity * POINT_LIGHT_K * dark;
-    if k <= 0.01 {
-        return None;
+    let dark = sample_keys(&st.ambient, s.game.blender.state.ambient_grayscale());
+    let mut points = Vec::new();
+    let mut fog = Vec::new();
+    for fire in items.iter().filter_map(|(_, item)| fire_item(s, item)) {
+        let FireSample {
+            strength,
+            intensity,
+            ..
+        } = fire.sample;
+        if has_fog && intensity != 0.0 && fog.len() < LIGHT_FAKER_SLOTS {
+            fog.push(fire.fog_light(s.camera_x, strength, intensity));
+        }
+        let k = intensity * POINT_LIGHT_K * dark;
+        if k > 0.01 {
+            points.push(PointLight {
+                at: fire.screen_position(s),
+                range: sample_keys(&st.range, strength) * PPU,
+                color: st.light_color.map(|c| c * k),
+            });
+        }
     }
-    let [r, g, b] = st.light_color;
-    Some(PointLight {
-        at,
-        range: sample_keys(&st.range, strength) * PPU,
-        color: [r * k, g * k, b * k],
-    })
+    (points, fog)
 }
 
-/// Where fire item `item` burns on screen, its definition and flicker seed.
-fn fire_item(s: &Session, item: &DrawItem) -> Option<((f32, f32), FireDef, u32)> {
+fn torch_z(fire: &FireDef) -> f32 {
+    MONARCH_Z + 0.001 + fire.at.2
+}
+
+/// The fire attachment before screen projection and the light child's Z offset.
+fn fire_item(s: &Session, item: &DrawItem) -> Option<FireItem> {
     match *item {
         DrawItem::Fire { o, f, scenery } => {
             let objs = if scenery {
@@ -724,30 +747,41 @@ fn fire_item(s: &Session, item: &DrawItem) -> Option<((f32, f32), FireDef, u32)>
                 &s.game.level.objects
             };
             let o = &objs[o];
-            let fire = s.world.protos[o.proto as usize].fires[f];
+            let def = s.world.protos[o.proto as usize].fires[f];
             let dir = if o.flip { -1.0 } else { 1.0 };
-            let at = layer_to_screen(
-                s,
-                o.x + dir * fire.at.0,
-                o.y + fire.at.1,
-                s.world.layer(o.layer).ratio,
-            );
-            Some((at, fire, o.id.wrapping_mul(7) + f as u32))
+            let layer = s.world.layer(o.layer);
+            Some(FireItem {
+                position: [
+                    o.x + dir * def.at.0,
+                    o.y + def.at.1,
+                    layer.z + o.z + def.at.2,
+                ],
+                ratio: layer.ratio,
+                def,
+                sample: s.fires.object(o, f, scenery)?,
+            })
         }
         DrawItem::Torch => {
             let m = &s.game.monarch;
-            let mut fire = s.world.steeds[s.game.steed as usize].torch?;
-            fire.real_light = true;
-            let at = world_to_screen(s, m.x + fire.at.0 * m.facing as f32, fire.at.1);
-            Some((at, fire, 1))
+            let def = s.world.steeds[s.game.steed as usize].torch?;
+            Some(FireItem {
+                position: [
+                    m.x + def.at.0 * m.facing as f32,
+                    WALK_Y + def.at.1,
+                    torch_z(&def),
+                ],
+                ratio: 1.0,
+                def,
+                sample: s.fires.torch()?,
+            })
         }
         _ => None,
     }
 }
 
 /// A fire: its flame and its glint on the water. Its light is gathered up
-/// front (`fire_light`) and falls on the sprites around it.
-fn draw_fire<R: Renderer>(c: &mut Ctx<R>, at: (f32, f32), fire: &FireDef, seed: u32) {
+/// front (`fire_lights`) and falls on the sprites around it.
+fn draw_fire<R: Renderer>(c: &mut Ctx<R>, at: (f32, f32), fire: &FireDef, elapsed: f32) {
     let s = c.s;
     let st = &s.world.fire;
     // The flame: the prefab nearest in size that has a sprite animation.
@@ -761,7 +795,7 @@ fn draw_fire<R: Renderer>(c: &mut Ctx<R>, at: (f32, f32), fire: &FireDef, seed: 
         .and_then(|f| f.1)
         .map(|id| s.world.sprites[id as usize].as_str())
     {
-        if let Some(sp) = flame_clip(c, name, s.t + seed as f32 * 0.13) {
+        if let Some(sp) = flame_clip(c, name, elapsed) {
             c.r.sprite(sp, at, Draw::tint(WHITE).additive());
         }
     }
@@ -1948,13 +1982,26 @@ fn draw_world<R: Renderer>(c: &mut Ctx<R>) {
     let clouds = cloud_draws(c, &light, game_z);
     let atmosphere = atmosphere_draws(s, c.sheet, &light);
     let items = draw_list_with_effects(s, &particles, &clouds, &atmosphere);
-    c.lights = items
-        .iter()
-        .filter_map(|(_, item)| fire_item(s, item))
-        .filter_map(|(at, fire, seed)| fire_light(s, at, &fire, seed))
-        .collect();
+    let has_fog = atmosphere.iter().any(|p| p.draw.depth_write);
+    let fog_lights;
+    (c.lights, fog_lights) = fire_lights(s, &items, has_fog);
+    let mut vertex_tints = Vec::new();
+    let mut fog_depth_active = false;
     for (key, item) in items {
-        c.r.depth(stereo_depth(-key.2 - game_z));
+        if !fog_depth_active
+            && matches!(item, DrawItem::Atmosphere(i) if atmosphere[i].draw.depth_write)
+        {
+            // The ground glow approximates lighting on the terrain material.
+            // Composite it into the scene behind the translucent fog.
+            c.r.depth(0.0);
+            draw_ground_light(c);
+            fog_depth_active = true;
+        }
+        let z = -key.2;
+        if fog_depth_active {
+            c.r.world_depth(z);
+        }
+        c.r.depth(stereo_depth(z - game_z));
         match item {
             DrawItem::Part(oi, pi) => draw_part(c, &s.game.level.objects[oi], pi),
             DrawItem::Scenery(oi, pi) => draw_part(c, &s.game.level.scenery[oi], pi),
@@ -2001,7 +2048,8 @@ fn draw_world<R: Renderer>(c: &mut Ctx<R>) {
             }
             DrawItem::Atmosphere(i) => {
                 let p = &atmosphere[i];
-                c.r.atmosphere_sprite(p.id, p.mesh, p.at, p.draw);
+                let tints = fog_vertex_tints(p, &fog_lights, &mut vertex_tints);
+                c.r.atmosphere_sprite(p.id, p.mesh, p.at, p.draw, tints);
             }
             DrawItem::Grass(i) => draw_grass(c, i),
             DrawItem::Animal(i) => draw_animal(c, i),
@@ -2016,8 +2064,8 @@ fn draw_world<R: Renderer>(c: &mut Ctx<R>) {
             DrawItem::LoosePart(i) => draw_loose_part(c, i),
             DrawItem::Deckhand(i) => draw_deckhand(c, i),
             DrawItem::Fire { .. } | DrawItem::Torch => {
-                if let Some((at, fire, seed)) = fire_item(s, &item) {
-                    draw_fire(c, at, &fire, seed);
+                if let Some(fire) = fire_item(s, &item) {
+                    draw_fire(c, fire.screen_position(s), &fire.def, fire.sample.elapsed);
                 }
             }
             DrawItem::Boulder(i) => {
@@ -2038,8 +2086,12 @@ fn draw_world<R: Renderer>(c: &mut Ctx<R>) {
         }
     }
 
-    c.r.depth(stereo_depth(0.0));
-    draw_ground_light(c);
+    if fog_depth_active {
+        c.r.world_depth(f32::NEG_INFINITY);
+    } else {
+        c.r.depth(0.0);
+        draw_ground_light(c);
+    }
     c.r.depth(0.0);
     // The teleporter exit (placeholder rings until its sprites are drawn).
     if let Some(e) = s.game.teleports.exit {
@@ -2059,9 +2111,10 @@ fn draw_world<R: Renderer>(c: &mut Ctx<R>) {
     }
 }
 
-fn atmosphere_tint(sample: AtmosphereSample, light: &Light) -> Option<Color> {
+fn atmosphere_material(sample: AtmosphereSample, light: &Light) -> Option<Draw> {
     let mut ambient = Color::rgba(light.colors[color::AMBIENT]);
-    if sample.kind == AtmosphereKind::Fog {
+    let fog = sample.kind == AtmosphereKind::Fog;
+    if fog {
         // Pow-Diffuse cuts fragments below .01. The fog sprites have binary
         // alpha, so the instance alpha alone decides whether anything survives.
         if sample.tint.a < 0.01 {
@@ -2069,7 +2122,43 @@ fn atmosphere_tint(sample: AtmosphereSample, light: &Light) -> Option<Color> {
         }
         ambient.a = 1.0;
     }
-    Some(sample.tint.times(ambient))
+    let draw = Draw::tint(sample.tint.times(ambient));
+    Some(if fog { draw.depth_write() } else { draw })
+}
+
+/// Pow-Diffuse adds nearby lights to ambient at the authored mesh vertices.
+/// The GPU interpolates the result through each triangle before applying coverage.
+fn fog_vertex_tints<'a>(
+    p: &AtmosphereDraw<'_>,
+    lights: &[FogLight],
+    tints: &'a mut Vec<Color>,
+) -> Option<&'a [Color]> {
+    if p.sample.kind != AtmosphereKind::Fog || lights.is_empty() {
+        return None;
+    }
+    let sample = p.sample;
+    let base = sample.tint;
+    let ambient = p.draw.tint;
+    tints.clear();
+    tints.extend(p.mesh.vertices.iter().map(|&local| {
+        let [x, y, z] =
+            cloud_shadow::world_point(local, sample.position, sample.scale, sample.flip);
+        let amount: f32 = lights
+            .iter()
+            .filter_map(|light| {
+                let [lx, ly, lz] = light.position;
+                let dist_sq = (x - lx).powi(2) + (y - ly).powi(2) + (z - lz).powi(2);
+                (dist_sq < 9.0).then(|| (1.0 - dist_sq.sqrt() / 3.0) * light.intensity)
+            })
+            .sum();
+        Color::new(
+            ambient.r + base.r * 0.49 * amount,
+            ambient.g + base.g * 0.425 * amount,
+            ambient.b + base.b * 0.34 * amount,
+            ambient.a,
+        )
+    }));
+    tints.iter().any(|&tint| tint != ambient).then_some(tints)
 }
 
 fn atmosphere_draws<'a>(s: &'a Session, sheet: &Sheet, light: &Light) -> Vec<AtmosphereDraw<'a>> {
@@ -2082,7 +2171,7 @@ fn atmosphere_draws<'a>(s: &'a Session, sheet: &Sheet, light: &Light) -> Vec<Atm
             let sprite = usize::from(sample.sprite);
             let id = sheet.id(&def.sprites[sprite])?;
             let art = sheet.get(id);
-            let [x, y, z] = sample.position;
+            let [x, y, _] = sample.position;
             let extent = art.px.abs().max((f32::from(art.w) - art.px).abs());
             if x.abs() * PPU > W / 2.0 + extent * sample.scale[0] + 16.0 {
                 return None;
@@ -2092,18 +2181,15 @@ fn atmosphere_draws<'a>(s: &'a Session, sheet: &Sheet, light: &Light) -> Vec<Atm
             if top >= H || top + f32::from(art.h) * sample.scale[1] <= 0.0 {
                 return None;
             }
-            let tint = atmosphere_tint(sample, light)?;
+            let draw = atmosphere_material(sample, light)?
+                .flip(sample.flip)
+                .affine([sample.scale[0], 0.0, 0.0, sample.scale[1]]);
             Some(AtmosphereDraw {
                 id,
                 mesh: &def.meshes[sprite],
                 at,
-                z,
-                draw: Draw::tint(tint).flip(sample.flip).affine([
-                    sample.scale[0],
-                    0.0,
-                    0.0,
-                    sample.scale[1],
-                ]),
+                sample,
+                draw,
             })
         })
         .collect()
@@ -2369,8 +2455,8 @@ mod tests {
     use super::sort_key;
 
     #[test]
-    fn fog_alpha_cutoff_and_mist_ambient_alpha_follow_their_pc_materials() {
-        use super::{atmosphere_tint, color, AtmosphereKind, AtmosphereSample, Color, Light};
+    fn only_covered_fog_blends_with_depth_writes() {
+        use super::{atmosphere_material, color, AtmosphereKind, AtmosphereSample, Color, Light};
 
         let mut light = Light::default();
         light.colors[color::AMBIENT] = [0.5, 0.25, 0.125, 0.5];
@@ -2382,21 +2468,261 @@ mod tests {
             flip: false,
             tint: Color::new(0.5, 0.75, 1.0, 0.009),
         };
-        assert_eq!(atmosphere_tint(sample, &light), None);
+        assert_eq!(atmosphere_material(sample, &light), None);
         sample.tint.a = 0.01;
-        assert_eq!(
-            atmosphere_tint(sample, &light),
-            Some(Color::new(0.25, 0.1875, 0.125, 0.01))
-        );
+        let fog = atmosphere_material(sample, &light).unwrap();
+        assert!(fog.depth_write);
+        assert!(!fog.additive);
+        assert_eq!(fog.tint, Color::new(0.25, 0.1875, 0.125, 0.01));
         sample.kind = AtmosphereKind::Mist;
+        let mist = atmosphere_material(sample, &light).unwrap();
+        assert!(!mist.depth_write);
+        assert!(!mist.additive);
+        assert_eq!(mist.tint, Color::new(0.25, 0.1875, 0.125, 0.005));
+    }
+
+    #[test]
+    fn fog_lights_at_flipped_scaled_vertices_in_three_dimensions() {
+        use super::{
+            atmosphere_material, color, fog_vertex_tints, AtmosphereDraw, AtmosphereKind,
+            AtmosphereSample, Color, FogLight, Light,
+        };
+        use crate::cloud_mesh::CloudMesh;
+
+        let mesh = CloudMesh {
+            vertices: vec![[0.0, -16.0], [32.0, 16.0], [-64.0, 0.0]],
+            indices: vec![0, 1, 2],
+        };
+        let mut light = Light::default();
+        light.colors[color::AMBIENT] = [0.0, 0.25, 0.5, 0.4];
+        let sample = AtmosphereSample {
+            kind: AtmosphereKind::Fog,
+            sprite: 0,
+            position: [4.0, 2.0, -3.0],
+            scale: [2.0, 3.0],
+            flip: true,
+            tint: Color::new(0.5, 0.75, 1.0, 0.6),
+        };
+        let mut p = AtmosphereDraw {
+            id: 0,
+            mesh: &mesh,
+            at: (0.0, 0.0),
+            sample,
+            draw: atmosphere_material(sample, &light).unwrap(),
+        };
+        let mut tints = Vec::new();
+        let behind = FogLight {
+            position: [2.0, 0.5, 0.0],
+            intensity: 1.0,
+        };
+        // A screen-aligned fire exactly three units back is outside the light.
+        assert!(fog_vertex_tints(&p, &[behind], &mut tints).is_none());
+        let near = FogLight {
+            position: [2.0, 0.5, -1.5],
+            intensity: 0.8,
+        };
+        let cancel = FogLight {
+            intensity: -0.2,
+            ..near
+        };
+        let colors = fog_vertex_tints(&p, &[behind, near, cancel], &mut tints).unwrap();
+        assert_eq!(colors.len(), mesh.vertices.len());
+        assert_eq!(colors[0], p.draw.tint);
+        assert_eq!(colors[2], p.draw.tint);
+        let expected = [
+            0.5 * 0.49 * 0.3,
+            0.75 * (0.25 + 0.425 * 0.3),
+            0.5 + 0.34 * 0.3,
+        ];
+        for (got, want) in [colors[1].r, colors[1].g, colors[1].b]
+            .into_iter()
+            .zip(expected)
+        {
+            assert!((got - want).abs() < 1e-6, "{got} != {want}");
+        }
+        assert!(colors.iter().all(|tint| tint.a == 0.6));
+        p.sample.kind = AtmosphereKind::Mist;
+        assert!(fog_vertex_tints(&p, &[near], &mut tints).is_none());
+    }
+
+    #[test]
+    fn fog_light_uses_the_fire_child_depth_and_unscaled_intensity() {
+        use super::{fire_lights, DrawItem, FireDef, Session, MONARCH_Z, WALK_Y};
+
+        let mut world = transform_world();
+        world.steeds[0].torch = Some(FireDef {
+            at: (0.5, 1.0, -0.5),
+            size: (1.0, 1.0),
+            night_only: false,
+            auto_start: true,
+            real_light: true,
+        });
+        world.fire.strength = vec![(0.0, 0.5)];
+        world.fire.intensity = vec![(0.0, 0.7)];
+        world.fire.ambient = vec![(0.0, 0.0)];
+        world.fire.torch_threshold = 1.1;
+        let mut s = Session::new(world, 0, 1, Default::default());
+        s.game.monarch.x = 12.0;
+        s.game.monarch.facing = -1;
+        s.camera_x = 10.0;
+        for _ in 0..=126 {
+            s.fires.step(&s.world, &s.game);
+        }
+
+        let (points, fog) = fire_lights(&s, &[((0, 0, 0.0), DrawItem::Torch)], true);
+        assert!(points.is_empty());
+        assert_eq!(fog.len(), 1);
+        assert_eq!(fog[0].intensity, 0.7);
         assert_eq!(
-            atmosphere_tint(sample, &light),
-            Some(Color::new(0.25, 0.1875, 0.125, 0.005))
+            fog[0].position,
+            [1.5, WALK_Y + 1.0, MONARCH_Z + 0.001 - 0.5 - 1.625]
         );
     }
 
+    #[test]
+    fn scene_fires_follow_delayed_night_events_and_statue_charge() {
+        use game::data::{Deity, FireDef, Layer, Proto, StatueDef};
+        use game::time::{DAY_END, DAY_START};
+
+        let mut world = transform_world();
+        let fire = FireDef {
+            at: (0.0, 1.0, -0.25),
+            size: (0.25, 0.25),
+            night_only: true,
+            auto_start: true,
+            real_light: false,
+        };
+        world.protos.push(Proto {
+            fires: vec![fire],
+            ..Default::default()
+        });
+        let shrine_fire = FireDef {
+            night_only: false,
+            auto_start: false,
+            ..fire
+        };
+        world.protos.push(Proto {
+            fires: vec![shrine_fire; 2],
+            statue: Some(StatueDef {
+                deity: Deity::Archer,
+                charge_days: 1.0,
+                charge_multiplier: 1.0,
+                max_charge: 3.0,
+                overgrown: None,
+                clean: None,
+                charge_parts: vec![],
+            }),
+            ..Default::default()
+        });
+        let mut s = super::Session::new(world, 0, 71, Default::default());
+        let lamp = s.game.level.add(game::level::instantiate(
+            &s.world,
+            0,
+            Layer::Game,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+        ));
+        let shrine = s.game.level.add(game::level::instantiate(
+            &s.world,
+            1,
+            Layer::Game,
+            2.0,
+            0.0,
+            0.0,
+            1.0,
+        ));
+        let drawn = |s: &super::Session, id| {
+            super::draw_list(s)
+                .into_iter()
+                .filter(|&(_, item)| {
+                    matches!(item, super::DrawItem::Fire { o, scenery: false, .. }
+                    if s.game.level.objects[o].id == id)
+                })
+                .count()
+        };
+        let idle = game::controls::RawInput::default();
+        s.game.clock.speed = 0.0;
+        s.game.clock.time = DAY_START + 1.0;
+        s.step_ticks(idle, 1);
+        assert_eq!(drawn(&s, lamp), 0);
+        assert_eq!(drawn(&s, shrine), 0);
+        s.game.statues.pay(&s.world, &s.game.level, shrine);
+        s.step_ticks(idle, 1);
+        assert_eq!(drawn(&s, shrine), 2);
+
+        s.game.clock.time = DAY_END + 1.0;
+        s.step_ticks(idle, 1);
+        assert_eq!(drawn(&s, lamp), 0);
+        s.step_ticks(idle, 300);
+        assert_eq!(drawn(&s, lamp), 1);
+        s.game.clock.time = DAY_START + 1.0;
+        s.step_ticks(idle, 1);
+        assert_eq!(drawn(&s, lamp), 1);
+        s.step_ticks(idle, 300);
+        assert_eq!(drawn(&s, lamp), 0);
+
+        s.game
+            .statues
+            .list
+            .iter_mut()
+            .find(|state| state.object == shrine)
+            .unwrap()
+            .charge = 0.0;
+        s.step_ticks(idle, 1);
+        assert_eq!(drawn(&s, shrine), 0);
+    }
+
+    #[test]
+    fn dark_torch_activates_immediately_and_restarts_its_light_after_resume() {
+        use game::data::FireDef;
+        use game::lighting::color::AMBIENT;
+
+        let mut world = transform_world();
+        world.steeds[0].torch = Some(FireDef {
+            at: (0.0, 1.0, 0.0),
+            size: (0.25, 0.25),
+            night_only: false,
+            auto_start: true,
+            real_light: true,
+        });
+        world.fire.torch_threshold = 0.5;
+        world.fire.intensity = vec![(0.0, 1.0)];
+        world.fire.ambient = vec![(0.0, 0.0)];
+        let mut s = super::Session::new(world, 0, 71, Default::default());
+        s.game.blender.state.colors[AMBIENT] = [0.25, 0.25, 0.25, 1.0];
+        s.fires.step(&s.world, &s.game);
+        assert_eq!(s.fires.torch().unwrap().intensity, 0.0);
+        for _ in 0..126 {
+            s.fires.step(&s.world, &s.game);
+        }
+        assert_eq!(s.fires.torch().unwrap().intensity, 1.0);
+
+        s.game.blender.state.colors[AMBIENT] = [0.5, 0.5, 0.5, 1.0];
+        s.fires.step(&s.world, &s.game);
+        assert!(s.fires.torch().is_none());
+        s.game.blender.state.colors[AMBIENT] = [0.25, 0.25, 0.25, 1.0];
+        s.fires.step(&s.world, &s.game);
+        assert_eq!(s.fires.torch().unwrap().intensity, 0.0);
+
+        for _ in 0..126 {
+            s.fires.step(&s.world, &s.game);
+        }
+        assert_eq!(s.fires.torch().unwrap().intensity, 1.0);
+        let mut expected_rng = s.game.rng.clone();
+        s.resume(s.game.clone());
+        assert_eq!(s.game.rng.clone().next_u32(), expected_rng.next_u32());
+        s.fires.step(&s.world, &s.game);
+        assert_eq!(s.fires.torch().unwrap().intensity, 0.0);
+    }
+
     #[derive(Default)]
-    struct Capture(Vec<(u32, (f32, f32), super::Draw)>, usize);
+    struct Capture(
+        Vec<(u32, (f32, f32), super::Draw)>,
+        usize,
+        Vec<(usize, f32)>,
+    );
     impl crate::render::Renderer for Capture {
         fn clear(&mut self, _: super::Color) {
             self.1 += 1;
@@ -2411,6 +2737,9 @@ mod tests {
         fn add(&mut self, _: super::Rect, _: super::Color) {}
         fn circle(&mut self, _: f32, _: f32, _: f32, _: super::Color) {}
         fn circle_lines(&mut self, _: f32, _: f32, _: f32, _: f32, _: super::Color) {}
+        fn world_depth(&mut self, z: f32) {
+            self.2.push((self.0.len(), z));
+        }
     }
 
     fn transform_world() -> game::data::WorldData {
@@ -2451,6 +2780,139 @@ mod tests {
             steeds: vec![Default::default()],
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn fog_pass_keeps_sorting_order_but_sends_real_depth_for_later_layers() {
+        use super::{color, Session, Sheet};
+        use crate::{atmosphere_data::AtmosphereDef, cloud_mesh::CloudMesh, sheet::Sprite};
+        use game::data::{Affine2, CloudLayerDef, Curve, Layer, Part, Proto};
+        use game::lighting::float;
+        use game::payment::{PayInput, PayableId, Target};
+
+        let mut world = transform_world();
+        world.sprites = vec!["background".into(), "late_far".into(), "late_near".into()];
+        world.protos.push(Proto {
+            parts: [(0, 0, 2.0), (1, 1, 2.0), (2, 1, -6.0)]
+                .map(|(sprite, sort_layer, z)| Part {
+                    sprite: Some(sprite),
+                    reflection_only: false,
+                    x: 0.0,
+                    y: 0.0,
+                    z,
+                    flip: false,
+                    flip_y: false,
+                    transform: Affine2::IDENTITY,
+                    node: 0,
+                    color: [255; 4],
+                    sort_layer,
+                    sort_order: 0,
+                    random: None,
+                    parent: None,
+                    recolor: false,
+                    lit: false,
+                    scaffold: false,
+                })
+                .into(),
+            ..Default::default()
+        });
+        let mut s = Session::new(world, 0, 1, Default::default());
+        let o = game::level::instantiate(&s.world, 0, Layer::Game, 0.0, 1.0, 0.0, 1.0);
+        let payable = s.game.level.add(o);
+        let mut sheet = Sheet::default();
+        sheet.names = s.world.sprites.clone();
+        sheet.names.push("fog".into());
+        sheet.sprites = vec![
+            Sprite {
+                page: 0,
+                x: 0,
+                y: 0,
+                w: 4,
+                h: 4,
+                px: 2.0,
+                py: 2.0,
+                masks: [None; 2],
+            };
+            4
+        ];
+        sheet.link(&s.world.sprites);
+        let constant = |value| Curve {
+            keys: vec![[0.0, value, 0.0, 0.0]],
+        };
+        let layer = CloudLayerDef {
+            origin: [0.0, 1.0, -4.0],
+            depth: 0.5,
+            width: 0.25,
+            wind_multiplier: 0.0,
+            lifetime: 60.0,
+            fade_time: 1.0,
+            vertical_motion: 0.0,
+            max_clouds: 1,
+            sprites: vec![0],
+            prefab_active: true,
+            allow_flip: false,
+            y_curve: constant(0.0),
+            scale_curve: constant(1.0),
+            parallax_curve: constant(1.0),
+        };
+        let def = AtmosphereDef {
+            fog: layer.clone(),
+            mist: layer,
+            sprites: vec!["fog".into()],
+            meshes: vec![CloudMesh {
+                vertices: vec![[-2.0, -2.0], [2.0, -2.0], [2.0, 2.0]],
+                indices: vec![0, 1, 2],
+            }],
+        };
+        let light = &mut s.game.blender.state;
+        light.colors[color::FOG] = [1.0; 4];
+        light.floats[float::FOG_DENSITY] = 1.0;
+        for _ in 0..3 {
+            s.clouds.step(&s.world, Some(&def), light, 1.0, s.camera_x);
+        }
+        let fog_z = s
+            .clouds
+            .atmosphere_samples(&def, light)
+            .next()
+            .unwrap()
+            .position[2];
+        s.atmosphere = Some(def);
+
+        let mut fog = Capture::default();
+        super::draw(&s, &sheet, &mut fog);
+        assert_eq!(fog.0.iter().map(|p| p.0).collect::<Vec<_>>(), [0, 3, 1, 2]);
+        assert!(fog.0[1].2.depth_write);
+        assert_eq!(
+            fog.2,
+            [(1, fog_z), (2, 2.0), (3, -6.0), (4, f32::NEG_INFINITY)]
+        );
+
+        s.game.blender.state.colors[color::FOG][3] = 0.0;
+        let mut clear = Capture::default();
+        super::draw(&s, &sheet, &mut clear);
+        assert_eq!(clear.0.iter().map(|p| p.0).collect::<Vec<_>>(), [0, 1, 2]);
+        assert!(
+            clear.2.is_empty(),
+            "keep the normal batching when there is no visible fog"
+        );
+
+        s.game.level.objects[0].z = 1.0;
+        s.game.pay.update(
+            &PayInput {
+                target: Some(Target {
+                    id: PayableId(payable),
+                    can_pay: true,
+                    price: 3,
+                }),
+                ..Default::default()
+            },
+            |_| {},
+        );
+        let (key, _) = super::draw_list(&s)
+            .into_iter()
+            .find(|(_, item)| matches!(item, super::DrawItem::PriceSlots))
+            .unwrap();
+        assert_eq!(key, (0, 0, -(1.0 - 0.005)));
     }
 
     #[test]

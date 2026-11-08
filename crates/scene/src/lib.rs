@@ -11,6 +11,7 @@ pub mod clipfile;
 pub mod cloud_mesh;
 pub mod cloud_shadow;
 pub mod clouds;
+mod fires;
 pub mod heraldry;
 pub mod render;
 pub mod session;
