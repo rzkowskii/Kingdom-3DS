@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="banner/banner.webp"
+  <img src="banner/gameplay.webp"
        alt="A mounted monarch rides beneath a red moon and through forest mist, with rippling reflections in the water."
        width="800">
 </p>

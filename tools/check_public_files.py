@@ -23,7 +23,7 @@ GAME_EXTENSIONS = {
 }
 
 # Binary files deliberately published after manual review (exact paths only).
-REVIEWED_BINARIES = {'banner/banner.webp'}
+REVIEWED_BINARIES = {'banner/gameplay.webp'}
 
 
 def problem(name, data):
