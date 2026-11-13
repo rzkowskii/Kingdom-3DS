@@ -1,11 +1,11 @@
 [workspace]
 resolver = "2"
-members = ["crates/game", "crates/platform", "crates/scene", "crates/desktop", "tools/extract"]
+members = ["crates/game", "crates/platform", "crates/scene", "crates/desktop", "crates/regress", "tools/extract"]
 # crates/n3ds targets armv6k-nintendo-3ds and is built separately with `cargo 3ds`.
 exclude = ["crates/n3ds"]
 
 [workspace.package]
 edition = "2021"
-version = "1.2.0"
+version = "1.3.0"
 license = "MIT"
 rust-version = "1.88"

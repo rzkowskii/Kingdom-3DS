@@ -1,0 +1,36 @@
+# Measured from the original game with the KingdomTrace harness
+# (`regress orig`). Numbers only; the traces stay local.
+id = "trace-citizen-walk-speed"
+title = "Citizen (peasant) walking speed, measured in the original"
+actions = ["720 frames: dir 0"]
+observation = []
+scenarios = ["citizen_walk"]
+
+[original]
+game_version = "Kingdom: New Lands 1.2.8 (Unity 2017.1.2p1)"
+platform = "LinuxPlayer"
+
+[setup]
+description = "A peasant spawned by the campfire with its AI off, Mover held at its walk speed (0.6) rightwards: effective citizen walking speed. Intro skipped as the skip button does; Time.captureFramerate = 60; UnityEngine.Random seeded per run."
+
+[setup.initial]
+"@drive" = "Peasant 0.6 1"
+"@player_x" = "Managers.kingdom.campfirePosition"
+island = "Land One, fresh start"
+seeds = "1,2,3"
+
+[[expected]]
+metric = "citizen_walk_speed"
+value = 0.4706
+tolerance = 0.01
+unit = "units/s"
+
+[evidence]
+kind = "repeated-measurement"
+source = "KingdomTrace harness (tools/orig-harness) scenario orig_citizen_walk, 3 run(s); traces kept locally in gamefiles/harness/traces/orig_citizen_walk/"
+confidence = "medium"
+independently_verified = false
+verification = ""
+samples = 3
+recorded_by = ""
+date = "2026-11-08"

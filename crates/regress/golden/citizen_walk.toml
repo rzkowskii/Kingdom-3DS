@@ -1,0 +1,249 @@
+# Blessed by `cargo run -p regress -- run --bless`. Internal regression
+# baseline, not original-game evidence.
+[meta]
+schema = 1
+commit = "9f1ac79c3ba2-dirty"
+build = "1.2.0"
+profile = "release"
+platform = "x86_64-unknown-linux-gnu"
+fixture = "citizen_walk"
+world = "synthetic"
+island = 0
+seed = 1
+ticks_per_frame = 1
+ticks = 540
+tick_seconds = 0.01666666753590107
+
+[[checkpoint]]
+version = 1
+tick = 60
+clock_day = 0
+day_shown = 1
+daytime = false
+season = "Summer"
+wallet = 0
+coins_live = 0
+coins_floating = 0
+coins_held = 0
+roles = [0, 1, 0, 0, 0, 0]
+objects = 0
+under_construction = 0
+has_crown = true
+game_over = false
+won = false
+clock_time = 4.099992752075195
+monarch_x = 0.0
+monarch_velocity = 0.0
+state_hash = "e0c36b86bd376773"
+event_hash = "1126b4b788db8bb1"
+
+[checkpoint.events]
+"WaveDue.Regular" = 1
+
+[[checkpoint]]
+version = 1
+tick = 120
+clock_day = 0
+day_shown = 1
+daytime = false
+season = "Summer"
+wallet = 0
+coins_live = 0
+coins_floating = 0
+coins_held = 0
+roles = [0, 1, 0, 0, 0, 0]
+objects = 0
+under_construction = 0
+has_crown = true
+game_over = false
+won = false
+clock_time = 4.199985504150391
+monarch_x = 0.0
+monarch_velocity = 0.0
+state_hash = "4866dc8228f193b5"
+event_hash = "1126b4b788db8bb1"
+
+[checkpoint.events]
+"WaveDue.Regular" = 1
+
+[[checkpoint]]
+version = 1
+tick = 180
+clock_day = 0
+day_shown = 1
+daytime = false
+season = "Summer"
+wallet = 0
+coins_live = 0
+coins_floating = 0
+coins_held = 0
+roles = [0, 1, 0, 0, 0, 0]
+objects = 0
+under_construction = 0
+has_crown = true
+game_over = false
+won = false
+clock_time = 4.299978256225586
+monarch_x = 0.0
+monarch_velocity = 0.0
+state_hash = "48ceecdd65679658"
+event_hash = "1126b4b788db8bb1"
+
+[checkpoint.events]
+"WaveDue.Regular" = 1
+
+[[checkpoint]]
+version = 1
+tick = 240
+clock_day = 0
+day_shown = 1
+daytime = false
+season = "Summer"
+wallet = 0
+coins_live = 0
+coins_floating = 0
+coins_held = 0
+roles = [0, 1, 0, 0, 0, 0]
+objects = 0
+under_construction = 0
+has_crown = true
+game_over = false
+won = false
+clock_time = 4.399971008300781
+monarch_x = 0.0
+monarch_velocity = 0.0
+state_hash = "577b8c87749c2682"
+event_hash = "1126b4b788db8bb1"
+
+[checkpoint.events]
+"WaveDue.Regular" = 1
+
+[[checkpoint]]
+version = 1
+tick = 300
+clock_day = 0
+day_shown = 1
+daytime = false
+season = "Summer"
+wallet = 0
+coins_live = 0
+coins_floating = 0
+coins_held = 0
+roles = [0, 1, 0, 0, 0, 0]
+objects = 0
+under_construction = 0
+has_crown = true
+game_over = false
+won = false
+clock_time = 4.499963760375977
+monarch_x = 0.0
+monarch_velocity = 0.0
+state_hash = "7597f9ac7240ecc1"
+event_hash = "1126b4b788db8bb1"
+
+[checkpoint.events]
+"WaveDue.Regular" = 1
+
+[[checkpoint]]
+version = 1
+tick = 360
+clock_day = 0
+day_shown = 1
+daytime = false
+season = "Summer"
+wallet = 0
+coins_live = 0
+coins_floating = 0
+coins_held = 0
+roles = [0, 1, 0, 0, 0, 0]
+objects = 0
+under_construction = 0
+has_crown = true
+game_over = false
+won = false
+clock_time = 4.599956512451172
+monarch_x = 0.0
+monarch_velocity = 0.0
+state_hash = "8af298ebe4b2564e"
+event_hash = "1126b4b788db8bb1"
+
+[checkpoint.events]
+"WaveDue.Regular" = 1
+
+[[checkpoint]]
+version = 1
+tick = 420
+clock_day = 0
+day_shown = 1
+daytime = false
+season = "Summer"
+wallet = 0
+coins_live = 0
+coins_floating = 0
+coins_held = 0
+roles = [0, 1, 0, 0, 0, 0]
+objects = 0
+under_construction = 0
+has_crown = true
+game_over = false
+won = false
+clock_time = 4.699949264526367
+monarch_x = 0.0
+monarch_velocity = 0.0
+state_hash = "5fee717b50ada48b"
+event_hash = "1126b4b788db8bb1"
+
+[checkpoint.events]
+"WaveDue.Regular" = 1
+
+[[checkpoint]]
+version = 1
+tick = 480
+clock_day = 0
+day_shown = 1
+daytime = false
+season = "Summer"
+wallet = 0
+coins_live = 0
+coins_floating = 0
+coins_held = 0
+roles = [0, 1, 0, 0, 0, 0]
+objects = 0
+under_construction = 0
+has_crown = true
+game_over = false
+won = false
+clock_time = 4.7999420166015625
+monarch_x = 0.0
+monarch_velocity = 0.0
+state_hash = "9496a19275630e86"
+event_hash = "1126b4b788db8bb1"
+
+[checkpoint.events]
+"WaveDue.Regular" = 1
+
+[[checkpoint]]
+version = 1
+tick = 540
+clock_day = 0
+day_shown = 1
+daytime = false
+season = "Summer"
+wallet = 0
+coins_live = 0
+coins_floating = 0
+coins_held = 0
+roles = [0, 1, 0, 0, 0, 0]
+objects = 0
+under_construction = 0
+has_crown = true
+game_over = false
+won = false
+clock_time = 4.899934768676758
+monarch_x = 0.0
+monarch_velocity = 0.0
+state_hash = "4205ca5bb909b210"
+event_hash = "1126b4b788db8bb1"
+
+[checkpoint.events]
+"WaveDue.Regular" = 1

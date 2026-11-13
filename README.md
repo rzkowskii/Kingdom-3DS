@@ -35,6 +35,47 @@ This fork currently uses asset format **v8** and save format **v12**. Rerun setu
 
 Saves refer to the exact `world.bin` they were made with. The cloud mesh, stereo, and atmosphere updates preserve those world bytes, so saves from earlier v8 cloud builds still load. If a conversion changes the world fingerprint, the game preserves the old slot and marks it incompatible. Keep the previous build, converted assets, and a copy of your saves to continue a run tied to a different world. [Save recovery](docs/p1-fidelity.md#save-compatibility-and-recovery) · [Asset compatibility](docs/p12-fog-and-mist.md)
 
+### Performance on Old 3DS
+
+Upstream v1.3.0 measured these results on an Old 3DS XL during the first days of a new game. They are a baseline for comparison with this fork:
+
+| | FPS |
+|---|---|
+| Idle | 57.9 |
+| Typical gameplay | about 26–35, depending on what's happening |
+| Lowest | 24.6 |
+| Highest | 59.9 |
+
+To see these numbers yourself, tap **SELECT** during gameplay to open the debug overlay. Its first line shows the current FPS (averaged over 30 frames), the lowest and highest readings, and the longest single frame since you opened it. Close and reopen the overlay to reset them. The overlay times each game system while it's open, so the numbers are slightly lower than normal play.
+
+## Screenshots
+
+> **Note:** In each upstream comparison, the **left** image is the original port running on PC and the **right** image is the original PC version of the game. We're still working to get as close to the base game as we can without sacrificing playability on the 3DS, so expect some visual differences.
+
+**Clear**
+
+![Clear season: Rust port (left) vs original PC game (right)](docs/images/compare-clear.png)
+
+**Dusty**
+
+![Dusty season: Rust port (left) vs original PC game (right)](docs/images/compare-dusty.png)
+
+**Fresh**
+
+![Fresh season: Rust port (left) vs original PC game (right)](docs/images/compare-fresh.png)
+
+**Bottom screen (3DS)**
+
+![3DS bottom screen showing the purse, time of day, stamina and camp compass](docs/images/bottomscreen.png)
+
+The bottom screen shows your coin purse and the current day. The top (yellow) bar is the time of day, the green bar is your stamina, and the compass below them points toward your camp.
+
+### How we check our work
+
+The comparison shots above come from the regression runner's time-of-day check (`regress tod`), which renders the port and the original at the same moments of the day so lighting differences are easy to spot.
+
+We check movement the same way. A small measurement harness (`tools/orig-harness/`) recorded the monarch's walk and gallop speeds and the citizens' walk and run speeds in the original PC game, using three seeds each. Only the numbers are saved, in `crates/regress/reference/`. The regression runner then plays the same movement in the port and fails if any speed drifts outside tolerance. Right now the port matches all four measured speeds to four decimal places. Because the runner is run before and after every optimization, a performance change can't quietly alter how the game plays.
+
 ## Installation
 
 There are two ways to build the game: the **automated install** (`build.sh`) installs every dependency and builds everything in one command, while the **manual install** lets you run each step yourself.
@@ -180,6 +221,7 @@ For development, use F1 on desktop or SELECT on 3DS to toggle diagnostics. Deskt
 - `crates/platform`: platform traits, save-file handling, and diagnostic controls.
 - `crates/scene`: shared rendering, UI, audio mixing, and session state.
 - `crates/desktop`: macroquad desktop backend.
+- `crates/regress`: headless gameplay regression and parity runner ([architecture](docs/regression/ARCHITECTURE.md)).
 - `crates/n3ds`: separately built 3DS backend.
 - `tools/extract`: local asset conversion and 3DS packaging helpers.
 - `build.sh`, `.example.env`: automated install.
@@ -190,10 +232,17 @@ Checks that do not require game files:
 ```sh
 cargo build --workspace --all-targets --locked
 cargo test --workspace --locked
+cargo run --release -p regress -- run --seeds 24 --tpf 1,2,3
 cargo clippy --workspace --all-targets --locked -- -D warnings
 shellcheck build.sh tools/setup.sh tools/cia/build.sh
 python3 tools/check_public_files.py
 ```
+
+The regression runner plays scripted scenarios (coins, paying, movement, building, day/night) on synthetic islands. It checks they're deterministic, unchanged by frame batching, consistent with blessed snapshots in `crates/regress/golden/`, and within tolerance of original-game reference values in `crates/regress/reference/`. Run it before and after an optimization: gameplay outcomes must not change. With your own converted assets you can also soak-test real islands (`regress soak --assets assets`), and record a fresh desktop session without touching saves with `--record bug.replay.toml` and replay it (`regress replay bug.replay.toml --assets assets`). Replays contain inputs only, but they're tied to your `world.bin`.
+
+Some reference values are measured from the original PC game with a local harness (`tools/orig-harness/`; numbers only, nothing from the game is committed). The port matches the measured monarch walk and gallop speeds and citizen walk and run speeds to four decimal places. These movement measurements come from the headless runner on desktop.
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for how to run the parity and regression tests before and after a change.
 
 CI runs these checks and a separate 3DS build with an empty RomFS, which verifies compilation without distributing game data. An empty RomFS build cannot run the game.
 

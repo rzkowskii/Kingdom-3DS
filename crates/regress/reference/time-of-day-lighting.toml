@@ -1,0 +1,81 @@
+# Documented mechanic, NOT an observation of the running original.
+# Values come from the scene data documented in docs/systems.md
+# ("Day/night cycle", visual transitions): Director.dawnStart = 05:00,
+# dayStart = 08:00, eveningStart = 16:00, nightStart = 21:15, with
+# Director.secondsPerInGameHour = 10. The gameplay day (Kingdom.dayStart
+# 05:00, dayEnd 21:30) is the same as in day-night-cycle.toml.
+id = "time-of-day-lighting"
+title = "When each lighting phase starts, and how long the lit day and the night last"
+
+[original]
+game_version = "Kingdom: New Lands, Steam Linux Mono build (Unity 2017.1.2p1)"
+platform = "pc-linux"
+
+[setup]
+description = "New game, no input, monarch in the open. The clock starts at 04:00 on day 0 in the night light. Metrics are taken on day 1."
+initial = { start_hour = 4.0, clock_speed = 1.0 }
+
+actions = ["Wait for three full days without pausing."]
+
+[[observation]]
+event = "Dawn light starts blending in"
+at_seconds = 10.0
+note = "05:00 on day 0, the same moment gameplay daytime starts. Expected from configuration, not timed."
+
+[[expected]]
+metric = "dawn_light_start_h"
+value = 5.0
+tolerance = 0.02
+unit = "h"
+
+[[expected]]
+metric = "day_light_start_h"
+value = 8.0
+tolerance = 0.02
+unit = "h"
+
+[[expected]]
+metric = "evening_light_start_h"
+value = 16.0
+tolerance = 0.02
+unit = "h"
+
+[[expected]]
+metric = "night_light_start_h"
+value = 21.25
+tolerance = 0.02
+unit = "h"
+
+[[expected]]
+metric = "light_cycle_s"
+value = 240.0
+tolerance = 0.25
+unit = "s"
+
+[[expected]]
+metric = "unscheduled_light_changes"
+value = 0.0
+tolerance = 0.0
+unit = "count"
+
+[[expected]]
+metric = "daytime_s"
+value = 165.0
+tolerance = 0.25
+unit = "s"
+
+[[expected]]
+metric = "night_s"
+value = 75.0
+tolerance = 0.25
+unit = "s"
+
+[evidence]
+kind = "documented-mechanic"
+source = "docs/systems.md, Day/night cycle: Director transition hours and Kingdom day bounds marked (scene), read from the user's own Kingdom_Data"
+confidence = "medium"
+independently_verified = false
+# Light onsets are found to within one tick (0.0017 h); 0.02 h allows for
+# the onset being reported halfway between two samples. lit_hours and the
+# per-phase ambient values depend on the presets, so they aren't here:
+# measure them on the real island with `regress tod`.

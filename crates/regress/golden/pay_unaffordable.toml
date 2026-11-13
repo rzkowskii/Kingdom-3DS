@@ -1,0 +1,419 @@
+# Blessed by `cargo run -p regress -- run --bless`. Internal regression
+# baseline, not original-game evidence.
+[meta]
+schema = 1
+commit = "9f1ac79c3ba2-dirty"
+build = "1.2.0"
+profile = "release"
+platform = "x86_64-unknown-linux-gnu"
+fixture = "pay_unaffordable"
+world = "synthetic"
+island = 0
+seed = 1
+ticks_per_frame = 1
+ticks = 750
+tick_seconds = 0.01666666753590107
+
+[[checkpoint]]
+version = 1
+tick = 60
+clock_day = 0
+day_shown = 1
+daytime = false
+season = "Summer"
+wallet = 0
+coins_live = 2
+coins_floating = 2
+coins_held = 0
+roles = [0, 0, 0, 0, 0, 0]
+objects = 1
+under_construction = 0
+has_crown = true
+game_over = false
+won = false
+clock_time = 4.099992752075195
+monarch_x = 0.0
+monarch_velocity = 0.0
+state_hash = "71582b34a5d07c39"
+event_hash = "fa36fddabaceda1e"
+
+[checkpoint.events]
+"Pay.CoinToPayable" = 2
+"Pay.Focus" = 1
+"Pay.ShowPrice" = 1
+"WaveDue.Regular" = 1
+
+[[checkpoint]]
+version = 1
+tick = 120
+clock_day = 0
+day_shown = 1
+daytime = false
+season = "Summer"
+wallet = 2
+coins_live = 0
+coins_floating = 0
+coins_held = 0
+roles = [0, 0, 0, 0, 0, 0]
+objects = 1
+under_construction = 0
+has_crown = true
+game_over = false
+won = false
+clock_time = 4.199985504150391
+monarch_x = 0.0
+monarch_velocity = 0.0
+state_hash = "bd978cad5fcfff68"
+event_hash = "ca51f8d8dd0bbf8b"
+
+[checkpoint.events]
+"Coin.PickedUp" = 2
+"Pay.CoinToPayable" = 2
+"Pay.Focus" = 1
+"Pay.ReleaseCoins" = 1
+"Pay.ShowPrice" = 1
+"WaveDue.Regular" = 1
+
+[[checkpoint]]
+version = 1
+tick = 180
+clock_day = 0
+day_shown = 1
+daytime = false
+season = "Summer"
+wallet = 2
+coins_live = 0
+coins_floating = 0
+coins_held = 0
+roles = [0, 0, 0, 0, 0, 0]
+objects = 1
+under_construction = 0
+has_crown = true
+game_over = false
+won = false
+clock_time = 4.299978256225586
+monarch_x = 0.0
+monarch_velocity = 0.0
+state_hash = "2070145ce1ec1326"
+event_hash = "ca51f8d8dd0bbf8b"
+
+[checkpoint.events]
+"Coin.PickedUp" = 2
+"Pay.CoinToPayable" = 2
+"Pay.Focus" = 1
+"Pay.ReleaseCoins" = 1
+"Pay.ShowPrice" = 1
+"WaveDue.Regular" = 1
+
+[[checkpoint]]
+version = 1
+tick = 240
+clock_day = 0
+day_shown = 1
+daytime = false
+season = "Summer"
+wallet = 2
+coins_live = 0
+coins_floating = 0
+coins_held = 0
+roles = [0, 0, 0, 0, 0, 0]
+objects = 1
+under_construction = 0
+has_crown = true
+game_over = false
+won = false
+clock_time = 4.399971008300781
+monarch_x = 0.0
+monarch_velocity = 0.0
+state_hash = "3bbf57ee99d03445"
+event_hash = "ca51f8d8dd0bbf8b"
+
+[checkpoint.events]
+"Coin.PickedUp" = 2
+"Pay.CoinToPayable" = 2
+"Pay.Focus" = 1
+"Pay.ReleaseCoins" = 1
+"Pay.ShowPrice" = 1
+"WaveDue.Regular" = 1
+
+[[checkpoint]]
+version = 1
+tick = 300
+clock_day = 0
+day_shown = 1
+daytime = false
+season = "Summer"
+wallet = 2
+coins_live = 0
+coins_floating = 0
+coins_held = 0
+roles = [0, 0, 0, 0, 0, 0]
+objects = 1
+under_construction = 0
+has_crown = true
+game_over = false
+won = false
+clock_time = 4.499963760375977
+monarch_x = 0.0
+monarch_velocity = 0.0
+state_hash = "a723d0167daad6a0"
+event_hash = "ca51f8d8dd0bbf8b"
+
+[checkpoint.events]
+"Coin.PickedUp" = 2
+"Pay.CoinToPayable" = 2
+"Pay.Focus" = 1
+"Pay.ReleaseCoins" = 1
+"Pay.ShowPrice" = 1
+"WaveDue.Regular" = 1
+
+[[checkpoint]]
+version = 1
+tick = 360
+clock_day = 0
+day_shown = 1
+daytime = false
+season = "Summer"
+wallet = 2
+coins_live = 0
+coins_floating = 0
+coins_held = 0
+roles = [0, 0, 0, 0, 0, 0]
+objects = 1
+under_construction = 0
+has_crown = true
+game_over = false
+won = false
+clock_time = 4.599956512451172
+monarch_x = 0.0
+monarch_velocity = 0.0
+state_hash = "43bc1b16ae646880"
+event_hash = "ca51f8d8dd0bbf8b"
+
+[checkpoint.events]
+"Coin.PickedUp" = 2
+"Pay.CoinToPayable" = 2
+"Pay.Focus" = 1
+"Pay.ReleaseCoins" = 1
+"Pay.ShowPrice" = 1
+"WaveDue.Regular" = 1
+
+[[checkpoint]]
+version = 1
+tick = 420
+clock_day = 0
+day_shown = 1
+daytime = false
+season = "Summer"
+wallet = 2
+coins_live = 0
+coins_floating = 0
+coins_held = 0
+roles = [0, 0, 0, 0, 0, 0]
+objects = 1
+under_construction = 0
+has_crown = true
+game_over = false
+won = false
+clock_time = 4.699949264526367
+monarch_x = 0.0
+monarch_velocity = 0.0
+state_hash = "e8876c30271f111b"
+event_hash = "ca51f8d8dd0bbf8b"
+
+[checkpoint.events]
+"Coin.PickedUp" = 2
+"Pay.CoinToPayable" = 2
+"Pay.Focus" = 1
+"Pay.ReleaseCoins" = 1
+"Pay.ShowPrice" = 1
+"WaveDue.Regular" = 1
+
+[[checkpoint]]
+version = 1
+tick = 480
+clock_day = 0
+day_shown = 1
+daytime = false
+season = "Summer"
+wallet = 2
+coins_live = 0
+coins_floating = 0
+coins_held = 0
+roles = [0, 0, 0, 0, 0, 0]
+objects = 1
+under_construction = 0
+has_crown = true
+game_over = false
+won = false
+clock_time = 4.7999420166015625
+monarch_x = 0.0
+monarch_velocity = 0.0
+state_hash = "934b8e1b8e9f7d1c"
+event_hash = "ca51f8d8dd0bbf8b"
+
+[checkpoint.events]
+"Coin.PickedUp" = 2
+"Pay.CoinToPayable" = 2
+"Pay.Focus" = 1
+"Pay.ReleaseCoins" = 1
+"Pay.ShowPrice" = 1
+"WaveDue.Regular" = 1
+
+[[checkpoint]]
+version = 1
+tick = 540
+clock_day = 0
+day_shown = 1
+daytime = false
+season = "Summer"
+wallet = 2
+coins_live = 0
+coins_floating = 0
+coins_held = 0
+roles = [0, 0, 0, 0, 0, 0]
+objects = 1
+under_construction = 0
+has_crown = true
+game_over = false
+won = false
+clock_time = 4.899934768676758
+monarch_x = 0.0
+monarch_velocity = 0.0
+state_hash = "5537846a68ba6ed9"
+event_hash = "ca51f8d8dd0bbf8b"
+
+[checkpoint.events]
+"Coin.PickedUp" = 2
+"Pay.CoinToPayable" = 2
+"Pay.Focus" = 1
+"Pay.ReleaseCoins" = 1
+"Pay.ShowPrice" = 1
+"WaveDue.Regular" = 1
+
+[[checkpoint]]
+version = 1
+tick = 600
+clock_day = 0
+day_shown = 1
+daytime = false
+season = "Summer"
+wallet = 2
+coins_live = 0
+coins_floating = 0
+coins_held = 0
+roles = [0, 0, 0, 0, 0, 0]
+objects = 1
+under_construction = 0
+has_crown = true
+game_over = false
+won = false
+clock_time = 4.999927520751953
+monarch_x = 0.0
+monarch_velocity = 0.0
+state_hash = "01690e3e338b7331"
+event_hash = "ca51f8d8dd0bbf8b"
+
+[checkpoint.events]
+"Coin.PickedUp" = 2
+"Pay.CoinToPayable" = 2
+"Pay.Focus" = 1
+"Pay.ReleaseCoins" = 1
+"Pay.ShowPrice" = 1
+"WaveDue.Regular" = 1
+
+[[checkpoint]]
+version = 1
+tick = 660
+clock_day = 0
+day_shown = 1
+daytime = true
+season = "Summer"
+wallet = 2
+coins_live = 0
+coins_floating = 0
+coins_held = 0
+roles = [0, 0, 0, 0, 0, 0]
+objects = 1
+under_construction = 0
+has_crown = true
+game_over = false
+won = false
+clock_time = 5.099920272827148
+monarch_x = 0.0
+monarch_velocity = 0.0
+state_hash = "43472a667c7461d5"
+event_hash = "a0684e19461a0229"
+
+[checkpoint.events]
+"Coin.PickedUp" = 2
+"Day.Started" = 1
+"Pay.CoinToPayable" = 2
+"Pay.Focus" = 1
+"Pay.ReleaseCoins" = 1
+"Pay.ShowPrice" = 1
+"WaveDue.Regular" = 1
+
+[[checkpoint]]
+version = 1
+tick = 720
+clock_day = 0
+day_shown = 1
+daytime = true
+season = "Summer"
+wallet = 2
+coins_live = 0
+coins_floating = 0
+coins_held = 0
+roles = [0, 0, 0, 0, 0, 0]
+objects = 1
+under_construction = 0
+has_crown = true
+game_over = false
+won = false
+clock_time = 5.199913024902344
+monarch_x = 0.0
+monarch_velocity = 0.0
+state_hash = "c650b1cd3e06dec0"
+event_hash = "a0684e19461a0229"
+
+[checkpoint.events]
+"Coin.PickedUp" = 2
+"Day.Started" = 1
+"Pay.CoinToPayable" = 2
+"Pay.Focus" = 1
+"Pay.ReleaseCoins" = 1
+"Pay.ShowPrice" = 1
+"WaveDue.Regular" = 1
+
+[[checkpoint]]
+version = 1
+tick = 750
+clock_day = 0
+day_shown = 1
+daytime = true
+season = "Summer"
+wallet = 2
+coins_live = 0
+coins_floating = 0
+coins_held = 0
+roles = [0, 0, 0, 0, 0, 0]
+objects = 1
+under_construction = 0
+has_crown = true
+game_over = false
+won = false
+clock_time = 5.249909400939941
+monarch_x = 0.0
+monarch_velocity = 0.0
+state_hash = "3ef6ac0a6d6156fd"
+event_hash = "a0684e19461a0229"
+
+[checkpoint.events]
+"Coin.PickedUp" = 2
+"Day.Started" = 1
+"Pay.CoinToPayable" = 2
+"Pay.Focus" = 1
+"Pay.ReleaseCoins" = 1
+"Pay.ShowPrice" = 1
+"WaveDue.Regular" = 1

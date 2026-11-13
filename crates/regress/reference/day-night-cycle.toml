@@ -1,0 +1,59 @@
+# Documented mechanic, NOT an observation of the running original.
+# Values come from the scene data documented in docs/systems.md
+# ("Day/night cycle"): Director.secondsPerInGameHour = 10, startTime = 04:00,
+# Kingdom.dayStart = 05:00, Kingdom.dayEnd = 21:30.
+id = "day-night-cycle"
+title = "Day length, daylight and night length from a fresh start"
+
+[original]
+game_version = "Kingdom: New Lands, Steam Linux Mono build (Unity 2017.1.2p1)"
+platform = "pc-linux"
+
+[setup]
+description = "New game on Land One, no input. The clock starts at 04:00 on day 0."
+initial = { start_hour = 4.0, clock_speed = 1.0 }
+
+actions = ["Wait for three full days without pausing."]
+
+[[observation]]
+event = "Day 1 begins (no day banner on the first morning)"
+at_seconds = 10.0
+note = "One in-game hour after 04:00. Expected from configuration, not timed."
+
+[[expected]]
+metric = "first_dawn_s"
+value = 10.0
+tolerance = 0.05
+unit = "s"
+
+[[expected]]
+metric = "daytime_s"
+value = 165.0
+tolerance = 0.25
+unit = "s"
+
+[[expected]]
+metric = "night_s"
+value = 75.0
+tolerance = 0.25
+unit = "s"
+
+[[expected]]
+metric = "day_length_s"
+value = 240.0
+tolerance = 0.25
+unit = "s"
+
+[[expected]]
+metric = "day_length_3_avg_s"
+value = 240.0
+tolerance = 0.25
+unit = "s"
+
+[evidence]
+kind = "documented-mechanic"
+source = "docs/systems.md, Day/night cycle: Director and Kingdom values marked (scene), read from the user's own Kingdom_Data"
+confidence = "medium"
+independently_verified = false
+# The 0.25 s tolerances allow for f32 clock accumulation over a 4 minute day
+# (game::time's own test allows ±10 frames over 240 s).

@@ -123,17 +123,25 @@ impl Tutorial {
         let was_guiding = g.alpha >= 1.0;
         g.anim_t += dt;
         if !self.hired {
-            let hired = [Role::Peasant, Role::Worker, Role::Archer, Role::Farmer, Role::Knight]
-                .iter()
-                .map(|&r| ctx.population.count(r))
-                .sum::<usize>();
+            let hired = [
+                Role::Peasant,
+                Role::Worker,
+                Role::Archer,
+                Role::Farmer,
+                Role::Knight,
+            ]
+            .iter()
+            .map(|&r| ctx.population.count(r))
+            .sum::<usize>();
             self.hired = hired >= HIRES;
         }
         self.wall_check -= dt;
         if !self.walled && self.wall_check <= 0.0 {
             self.wall_check = 0.5;
             self.walled = level.objects.iter().any(|o| {
-                ctx.world.protos[o.proto as usize].wall_level.is_some_and(|l| l >= 1)
+                ctx.world.protos[o.proto as usize]
+                    .wall_level
+                    .is_some_and(|l| l >= 1)
                     && !under_construction(ctx.world, o)
             });
         }
@@ -175,7 +183,14 @@ impl Tutorial {
             xs.min_by(|a, b| (a - g.x).abs().total_cmp(&(b - g.x).abs()))
         };
         let target = if !self.hired {
-            nearest(&mut ctx.population.units.iter().filter(|u| u.role == Role::Beggar).map(|u| u.x))
+            nearest(
+                &mut ctx
+                    .population
+                    .units
+                    .iter()
+                    .filter(|u| u.role == Role::Beggar)
+                    .map(|u| u.x),
+            )
         } else {
             nearest(
                 &mut level
@@ -228,7 +243,11 @@ fn show_goal(g: &mut Ghost, goal: f32, monarch_x: f32, dt: f32) {
     let near_dist = PLAYER_DIST * 3.0;
     let near = (monarch_x - goal).abs() < near_dist;
     let reach = if near { near_dist } else { PLAYER_DIST };
-    let side = if monarch_x < goal { goal - GOAL_DIST } else { goal + GOAL_DIST };
+    let side = if monarch_x < goal {
+        goal - GOAL_DIST
+    } else {
+        goal + GOAL_DIST
+    };
     let to = side.clamp(monarch_x - reach, monarch_x + reach);
     let d = (to - g.x).abs();
     g.since_moved += dt;

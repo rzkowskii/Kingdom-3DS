@@ -1,0 +1,44 @@
+# Copy to <id>.toml (the file name must equal `id`) and fill in from the
+# RUNNING original game. Leave anything you didn't measure out; never
+# estimate a number and record it as observed.
+#
+# Keep proprietary material out: no screenshots, video, extracted assets or
+# decompiled code in this repository. Describe recordings in
+# `evidence.source` (where they're kept, which timestamps) instead.
+
+id = "example-id"
+title = "What is being measured"
+
+[original]
+game_version = "Kingdom: New Lands <store> <build id / date>, Unity <version>"
+platform = "pc-linux | pc-windows | pc-macos"
+
+[setup]
+description = "Island, day, coins, citizens, anything that matters for the result."
+initial = { island = 1, coins = 5 }
+
+actions = [
+  "Each player action in order, with timing if it matters.",
+]
+
+[[observation]]
+event = "What happened"
+at_seconds = 0.0          # from the start of the measurement
+tolerance_seconds = 0.5   # how precisely you could time it
+note = "How it was timed (stopwatch, frame count of a 60 fps recording, ...)"
+
+[[expected]]
+metric = "metric_name_the_scenario_reports"
+value = 0.0
+tolerance = 0.0           # measurement precision, not "close enough"
+unit = "s"
+
+[evidence]
+kind = "manual-observation"   # recording | trace | repeated-measurement | documented-mechanic
+source = "Where the evidence is kept and how to find the moment in it"
+confidence = "low"            # low | medium (high needs independent verification)
+independently_verified = false
+verification = ""             # who re-checked it in the original, and how
+samples = 1                   # runs measured (repeated-measurement needs >= 2)
+recorded_by = ""
+date = ""

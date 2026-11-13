@@ -1,0 +1,28 @@
+# Documented mechanic, NOT an observation of the running original.
+# This is the steed's speed *setting* (what Mover asks for). The original
+# moves slower than this; see trace-walk-speed / trace-gallop-speed for
+# measured, effective speeds.
+id = "horse-regular-gallop-speed"
+title = "The default steed's gallop speed"
+
+[original]
+game_version = "Kingdom: New Lands, Steam Linux Mono build (Unity 2017.1.2p1)"
+platform = "pc-linux"
+
+[setup]
+description = "Monarch on the default steed (Horse Regular) with full stamina, open flat ground, no forest."
+initial = { steed = "Horse Regular", stamina = 1.0 }
+
+actions = ["Hold right and sprint for 4 s."]
+
+[[expected]]
+metric = "gallop_speed_setting"
+value = 3.6
+tolerance = 0.03
+unit = "units/s"
+
+[evidence]
+kind = "documented-mechanic"
+source = "docs/systems.md, Monarch and steed: Player.standardSteedPrefab (Horse Regular) run speed"
+confidence = "medium"
+independently_verified = false

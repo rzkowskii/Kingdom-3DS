@@ -142,6 +142,13 @@ fn main() {
     let mut prof_last: Vec<(String, f64)> = Vec::new();
     let mut ticks_since = 0u32;
     let mut last = std::time::Instant::now();
+    // FPS for the debug overlay: each 30-frame window's average, plus the
+    // lowest and highest window and the longest single frame since the
+    // overlay was last opened (reopen it to reset).
+    let mut fps_window = std::time::Instant::now();
+    let mut fps_low = f32::MAX;
+    let mut fps_high = 0.0f32;
+    let mut worst_ms = 0.0f32;
     while apt.main_loop() {
         hid.scan_input();
         let down = hid.keys_down();
@@ -185,6 +192,15 @@ fn main() {
         if hid.keys_up().contains(KeyPad::SELECT) {
             if !chorded {
                 s.debug = !s.debug;
+                if s.debug {
+                    fps_low = f32::MAX;
+                    fps_high = 0.0;
+                    worst_ms = 0.0;
+                    fps_window = std::time::Instant::now();
+                    frames = 0;
+                    ticks_since = 0;
+                    prof_last = game::prof::report();
+                }
             }
             chorded = false;
         }
@@ -219,8 +235,13 @@ fn main() {
         // (ticks owed) has slack: a plain rounding would sometimes run 0 or
         // 2 ticks in a row of smooth frames, which judders while scrolling.
         let now = std::time::Instant::now();
-        acc += (now - last).as_secs_f32().min(0.1) / TICK;
+        let frame_s = (now - last).as_secs_f32();
+        acc += frame_s.min(0.1) / TICK;
         last = now;
+        // The first frame after opening the overlay can include the toggle.
+        if s.debug && frames > 0 {
+            worst_ms = worst_ms.max(frame_s * 1000.0);
+        }
         let ticks = if acc >= 2.0 { (acc as u32).min(4) } else { 1 };
         acc = (acc - ticks as f32).clamp(-1.0, 4.0);
         // The tick profiler reads the clock at every mark: only while the
@@ -260,6 +281,11 @@ fn main() {
         avg[5] += (gpu.gpu_ms() - avg[5]) * 0.05;
         frames = frames.wrapping_add(1);
         if s.debug && frames % 30 == 0 {
+            let window_s = (t3 - fps_window).as_secs_f32();
+            fps_window = t3;
+            let fps_now = 30.0 / window_s.max(1e-3);
+            fps_low = fps_low.min(fps_now);
+            fps_high = fps_high.max(fps_now);
             // Per-system tick times since the last report (game "profile" feature).
             let now_prof = game::prof::report();
             let mut rows: Vec<(String, f64)> = now_prof
@@ -278,7 +304,11 @@ fn main() {
             prof_last = now_prof;
             ticks_since = 0;
             s.note = format!(
-                "{}\n{}\n{}",
+                "fps {:.1}  low {:.1}  high {:.1}  worst frame {:.1} ms\n{}\n{}\n{}",
+                fps_now,
+                fps_low,
+                fps_high,
+                worst_ms,
                 top.join("  "),
                 sound.status(),
                 format!(

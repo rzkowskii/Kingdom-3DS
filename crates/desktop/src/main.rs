@@ -13,6 +13,7 @@
 //! `--greed-at N` spawns 3 greed at frame N; `--build` finishes construction every second;
 //! `--prefer Castle,Farmhouse` steers the autopilot's purchases; `--goto X@F` sends it to x = X from frame F;
 //! `--new` ignores the saved game, `--load` loads it even for a screenshot, `--no-save` turns saving off (screenshot runs never save);
+//! `--record FILE` records a fresh run without writing to save slots (`cargo run -p regress -- replay FILE --assets assets`);
 //! `--weather "Clear Summer"` holds the lighting to that weather's presets; `--hour H` starts the clock at hour H;
 //! `--boat-at N` does what H does at frame N; `--unlocked` starts with every unlock and island (otherwise a first playthrough); `--mute` turns sound off; `--paused` opens the pause menu, `--banner` the banner editor; `--tap X,Y` (repeatable) taps the touch screen at the start.
 
@@ -83,6 +84,30 @@ fn camera_for(rt: &RenderTarget, w: f32, h: f32) -> Camera2D {
 #[macroquad::main(window_conf)]
 async fn main() {
     let screenshot = std::env::args().skip_while(|a| a != "--screenshot").nth(1);
+    // Dev (`regress tod`): screenshots at clock times, one `DAY HOUR PATH`
+    // per line; the run ends after the last one.
+    let mut shots: Vec<(f64, String)> = arg::<String>("--shots")
+        .map(|f| {
+            let text = std::fs::read_to_string(&f).unwrap_or_else(|e| {
+                eprintln!("{f}: {e}");
+                std::process::exit(1);
+            });
+            let mut v: Vec<(f64, String)> = text
+                .lines()
+                .filter_map(|l| {
+                    let mut p = l.splitn(3, ' ');
+                    let day: f64 = p.next()?.parse().ok()?;
+                    let hour: f64 = p.next()?.parse().ok()?;
+                    Some((day * 24.0 + hour, p.next()?.to_owned()))
+                })
+                .collect();
+            v.sort_by(|a, b| a.0.total_cmp(&b.0));
+            v
+        })
+        .unwrap_or_default();
+    let shooting = screenshot.is_some() || !shots.is_empty();
+    // Dev: no autopilot in screenshot runs; the monarch stands still.
+    let idle = std::env::args().any(|a| a == "--idle");
     let shot_frame: u32 = std::env::args()
         .skip_while(|a| a != "--frame")
         .nth(1)
@@ -139,9 +164,9 @@ async fn main() {
     let weather: Option<String> = arg("--weather");
     // Dev: start the clock at this hour (`--hour 23`).
     let start_hour: Option<f32> = arg("--hour");
-    // Saves: off for screenshot runs and with --no-save. A saved run resumes
-    // unless --new or --island is given.
-    let storage = (screenshot.is_none() && !std::env::args().any(|a| a == "--no-save"))
+    let record: Option<String> = arg("--record");
+    // A recording starts a fresh simulation and must not overwrite the active slot.
+    let storage = (!shooting && record.is_none() && !std::env::args().any(|a| a == "--no-save"))
         .then(storage::Files::new);
     let progress = if std::env::args().any(|a| a == "--unlocked") {
         Progress::everything()
@@ -151,7 +176,7 @@ async fn main() {
             .map(|s| Session::saved_progress(s))
             .unwrap_or_default()
     };
-    let fresh = std::env::args().any(|a| a == "--new" || a == "--island");
+    let fresh = record.is_some() || std::env::args().any(|a| a == "--new" || a == "--island");
     let slot = storage.as_ref().map_or(0, |s| Session::last_slot(s));
     // --load reads the saved game even in screenshot runs (still never writing).
     let saved = (storage.is_none() && !fresh && std::env::args().any(|a| a == "--load"))
@@ -163,11 +188,34 @@ async fn main() {
                 None
             }
         });
+    let record_progress = progress.clone();
     let mut app = Session::new(world, island, seed, progress);
     app.atmosphere = atmosphere;
     app.debug = std::env::args().any(|a| a == "--debug");
     if let Some(h) = start_hour {
         app.game.clock.time = h;
+    }
+    // Dev: start at the campfire, out of the forest, where the harness puts
+    // the original's monarch (`@player_x`).
+    if std::env::args().any(|a| a == "--camp") {
+        app.game.monarch.x = app.game.campfire;
+        app.game.monarch.velocity = 0.0;
+        app.camera_x = app.game.monarch.x;
+    }
+    // Dev: every day gets this weather, blending on the normal schedule
+    // (`--force-weather Foggy`; unlike `--weather`, which holds presets).
+    if let Some(name) = arg::<String>("--force-weather") {
+        match regress::tod::weather_flag(&name) {
+            Some(flag) => app.game.director.force_weather(&app.world, flag),
+            None => {
+                eprintln!("unknown weather {name:?}");
+                std::process::exit(1);
+            }
+        }
+    }
+    // Dev: greed can't take the crown (screenshots through the night).
+    if std::env::args().any(|a| a == "--god") {
+        app.god = true;
     }
     app.storage = storage.map(|s| Box::new(s) as Box<dyn Storage>);
     app.world_id = world_id;
@@ -196,7 +244,7 @@ async fn main() {
         }
     }
     // Sound (off for screenshot runs and with --mute).
-    let mut sound = (screenshot.is_none() && !std::env::args().any(|a| a == "--mute")).then(|| {
+    let mut sound = (!shooting && !std::env::args().any(|a| a == "--mute")).then(|| {
         (
             audio::Audio::new(std::path::Path::new(&dir), &app.world.audio),
             ::scene::sound::Player::new(&app.world),
@@ -229,6 +277,31 @@ async fn main() {
         }),
     };
     let build_every_second = std::env::args().any(|a| a == "--build");
+    // The recorder, and the state hash after the last step: if it changes
+    // between steps (dev keys, the map, --coins), the replay is tainted.
+    let mut recorder = record.as_ref().map(|path| {
+        // The file name only: no local paths in a file meant to be shared.
+        let name = std::path::Path::new(path)
+            .file_name()
+            .map_or_else(|| path.clone(), |n| n.to_string_lossy().into_owned());
+        let mut r = regress::replay::Recorder::new(
+            &name,
+            world_id,
+            island,
+            seed,
+            &record_progress,
+            start_hour,
+        );
+        for flag in std::env::args().filter(|a| {
+            matches!(
+                a.as_str(),
+                "--camp" | "--coins" | "--tap" | "--weather" | "--force-weather"
+            )
+        }) {
+            r.taint(format!("started with {flag}"));
+        }
+        (r, regress::sim::state_hash(&app.game), false)
+    });
     let mut acc = 0.0;
     let mut frame = 0u32;
     prevent_quit();
@@ -343,8 +416,12 @@ async fn main() {
         if is_key_pressed(KeyCode::Escape) || (is_key_pressed(KeyCode::Enter) && !map_open) {
             app.set_paused(!app.paused);
         }
-        if screenshot.is_some() {
-            raw = pilot.input(&app.game, &app.world, frame);
+        if shooting {
+            raw = if idle {
+                Default::default()
+            } else {
+                pilot.input(&app.game, &app.world, frame)
+            };
         }
         if build_every_second && frame.is_multiple_of(60) {
             app.game.complete_construction(&app.world);
@@ -352,11 +429,26 @@ async fn main() {
 
         if !app.paused {
             acc += get_frame_time().min(0.1);
-            if screenshot.is_some() {
+            if shooting {
                 acc = TICK;
             }
             while acc >= TICK {
+                if let Some((r, last, warned)) = &mut recorder {
+                    if !*warned && regress::sim::state_hash(&app.game) != *last {
+                        r.taint(format!(
+                            "state changed outside the simulation at frame {frame}"
+                        ));
+                        *warned = true;
+                    }
+                    if app.god {
+                        r.taint("god mode");
+                    }
+                    r.frame(raw, app.speed);
+                }
                 app.step(raw);
+                if let Some((_, last, _)) = &mut recorder {
+                    *last = regress::sim::state_hash(&app.game);
+                }
                 raw.bag_tap = false;
                 acc -= TICK;
             }
@@ -399,6 +491,21 @@ async fn main() {
         }
 
         frame += 1;
+        let now = app.game.clock.day as f64 * 24.0 + app.game.clock.time as f64;
+        while shots.first().is_some_and(|s| now >= s.0) {
+            let (_, path) = shots.remove(0);
+            get_screen_data().export_png(&path);
+            println!(
+                "shot day {} {:.3} h {path}",
+                app.game.clock.day, app.game.clock.time
+            );
+            for (p, w) in app.game.blender.presets() {
+                println!("light {} {w:.3}", app.world.lights[p as usize].name);
+            }
+        }
+        if shooting && screenshot.is_none() && shots.is_empty() {
+            break;
+        }
         if let Some(path) = &screenshot {
             if frame == shot_frame && std::env::var_os("KINGDOM_UNITS").is_some() {
                 eprintln!("wallet {}", app.game.wallet.coins());
@@ -445,5 +552,20 @@ async fn main() {
             }
         }
         next_frame().await;
+    }
+    if let (Some((r, ..)), Some(path)) = (recorder, &record) {
+        let replay = r.finish(&app);
+        match std::fs::write(path, replay.to_toml()) {
+            Ok(()) => eprintln!(
+                "recorded {} ticks to {path}{}",
+                replay.final_tick,
+                if replay.tainted.is_empty() {
+                    ""
+                } else {
+                    " (tainted: see the file)"
+                }
+            ),
+            Err(e) => eprintln!("could not write {path}: {e}"),
+        }
     }
 }

@@ -78,6 +78,10 @@ pub struct Director {
     begin_winter: i32,
     /// Weather of each scheduled day (orig: picked in `AddDay`), for debugging and UI.
     pub weather_by_day: Vec<u16>,
+    /// Dev and regression tools: every day gets this weather instead of
+    /// its random pick (see [`Director::force_weather`]). Not saved.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    forced_weather: Option<u16>,
 }
 
 impl Director {
@@ -98,6 +102,33 @@ impl Director {
             begin_autumn: range(cfg.autumn_start, rng),
             begin_winter: range(cfg.winter_start, rng),
             weather_by_day: Vec::new(),
+            forced_weather: None,
+        }
+    }
+
+    /// Dev and regression tools: from now on every day has `weather` (an
+    /// `orig: BlenderState.Weather` flag value), including the lighting
+    /// already scheduled. The random pick still happens, so the RNG and
+    /// with it gameplay stay as they were; only the lighting changes.
+    /// Parts of the day without a preset for that weather keep theirs.
+    pub fn force_weather(&mut self, world: &WorldData, weather: u16) {
+        self.forced_weather = Some(weather);
+        self.weather_by_day.fill(weather);
+        for e in &mut self.events {
+            if let EventKind::Light { preset, .. } = &mut e.kind {
+                let l = &world.lights[*preset as usize];
+                if l.category != 1 {
+                    continue;
+                }
+                let season = match l.season {
+                    2 => Season::Autumn,
+                    4 => Season::Winter,
+                    _ => Season::Summer,
+                };
+                if let Some(p) = Self::weather_preset(world, weather, season, l.part_of_day) {
+                    *preset = p;
+                }
+            }
         }
     }
 
@@ -154,11 +185,16 @@ impl Director {
     fn add_day(&mut self, world: &WorldData, day: u16, wave: Option<WaveKind>, rng: &mut Rng) {
         self.last_day_added += 1;
         let d = self.last_day_added as u32;
-        let weather = Self::random_weather(world.days[day as usize].weathers, rng);
+        let random = Self::random_weather(world.days[day as usize].weathers, rng);
+        let weather = self.forced_weather.unwrap_or(random);
         self.weather_by_day.push(weather);
         for (part, (_, start, end)) in TRANSITIONS.iter().enumerate() {
+            // A forced weather without this part of the day keeps the
+            // random pick's preset (as `force_weather` does).
             if let Some(preset) =
-                Self::weather_preset(world, weather, self.adding_for_season, part as u8)
+                Self::weather_preset(world, weather, self.adding_for_season, part as u8).or_else(
+                    || Self::weather_preset(world, random, self.adding_for_season, part as u8),
+                )
             {
                 self.add_event(Event {
                     day: d,
@@ -311,6 +347,68 @@ mod tests {
     use crate::data::*;
     use alloc::string::ToString;
     use alloc::vec;
+
+    #[test]
+    fn forced_weather_changes_only_the_lighting() {
+        let mut w = world();
+        // A second weather (2) with its own presets, in summer only.
+        let extra: Vec<_> = w
+            .lights
+            .iter()
+            .filter(|l| l.season == 1)
+            .map(|l| LightPreset {
+                weather: 2,
+                ..l.clone()
+            })
+            .collect();
+        w.lights.extend(extra);
+        let run = |force: bool| {
+            let mut rng = Rng::new(5);
+            let mut d = Director::new(&w, 0, &mut rng);
+            let mut blender = Blender::new(&w);
+            let mut clock = Clock::new();
+            let mut pushed = Vec::new();
+            for _ in 0..(14 * 240 * 60) {
+                clock.advance(1.0 / 60.0);
+                if force && d.forced_weather.is_none() && clock.time > 4.5 {
+                    // After day 0's lighting was scheduled.
+                    d.force_weather(&w, 2);
+                }
+                let next = d.events.first().copied();
+                let before = d.events.len();
+                d.update(&w, &clock, &mut blender, &mut rng, |_| {});
+                if d.events.len() < before {
+                    if let Some(Event {
+                        kind: EventKind::Light { preset, .. },
+                        day,
+                        ..
+                    }) = next
+                    {
+                        let l = &w.lights[preset as usize];
+                        pushed.push((day, l.season, l.weather));
+                    }
+                }
+            }
+            (rng.next_u32(), pushed)
+        };
+        let (free_rng, free) = run(false);
+        let (forced_rng, forced) = run(true);
+        assert_eq!(free_rng, forced_rng, "forcing must not touch the RNG");
+        assert!(free.iter().all(|p| p.2 == 1), "{free:?}");
+        assert!(forced.len() > 20 && forced.len() == free.len());
+        // Summer presets switch; autumn and winter have no weather 2, so
+        // they keep the random pick's.
+        assert!(
+            forced
+                .iter()
+                .all(|&(_, season, wx)| wx == if season == 1 { 2 } else { 1 }),
+            "{forced:?}"
+        );
+        assert!(
+            forced.iter().any(|p| p.1 != 1),
+            "reaches autumn: {forced:?}"
+        );
+    }
 
     fn world() -> WorldData {
         let day = |name: &str, seasons: u8| DayDef {

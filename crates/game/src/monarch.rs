@@ -11,6 +11,14 @@ use crate::rng::Rng;
 /// velocity up instantly but never sets it down; Box2D friction slows the
 /// body instead: √(Player material 1.0 × default 0.4) × gravity 15.
 const FRICTION_DECEL: f32 = 9.487;
+/// Unity's fixed physics step (`Time.fixedDeltaTime`, 50 Hz).
+const PHYSICS_STEP: f32 = 0.02;
+/// Speed lost to friction while `Mover` holds a speed. Every physics step,
+/// Box2D takes friction off the velocity *before* it moves the body, then
+/// `Mover.Update()` snaps the velocity back up to the target. So the body
+/// always moves this much slower than its speed setting. Measured in the
+/// original: walk 2.0 → 1.8103, gallop 3.6 → 3.4103 (trace fixtures).
+const HELD_SPEED_LOSS: f32 = FRICTION_DECEL * PHYSICS_STEP;
 
 /// Per-steed tuning. orig: `Steed` fields (values from the steed prefabs).
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -191,8 +199,13 @@ impl Monarch {
             rng,
             &mut emit,
         );
-        self.update_velocity(dt);
-        self.x += self.velocity * dt;
+        let held = self.update_velocity(dt);
+        let moved = if held {
+            self.velocity - self.velocity.signum() * HELD_SPEED_LOSS.min(self.velocity.abs())
+        } else {
+            self.velocity
+        };
+        self.x += moved * dt;
     }
 
     /// orig: `Player.SetGroundType()`.
@@ -334,13 +347,19 @@ impl Monarch {
     }
 
     /// orig: `Mover.Update()` with `maxAccelerationPerFrame = 0` (Player prefab),
-    /// plus ground friction from the physics engine.
-    fn update_velocity(&mut self, dt: f32) {
+    /// plus ground friction from the physics engine. `velocity` is the speed
+    /// setting `Mover` writes. Returns whether `Mover` is holding it at a
+    /// non-zero target this frame, i.e. the case where friction keeps eating
+    /// [`HELD_SPEED_LOSS`] out of every physics step.
+    fn update_velocity(&mut self, dt: f32) -> bool {
         let target = self.move_speed * self.speed_multiplier * self.facing as f32;
+        // In the original, friction has always just dragged the body below
+        // the target, so an equal speed counts as speeding up too.
         let speeding_up =
-            (target > 0.0 && target > self.velocity) || (target < 0.0 && target < self.velocity);
+            (target > 0.0 && target >= self.velocity) || (target < 0.0 && target <= self.velocity);
         if speeding_up {
             self.velocity = target;
+            true
         } else {
             let step = FRICTION_DECEL * dt;
             self.velocity = if self.velocity > target {
@@ -348,6 +367,7 @@ impl Monarch {
             } else {
                 (self.velocity + step).min(target)
             };
+            false
         }
     }
 }
@@ -393,7 +413,19 @@ mod tests {
         s.run(1, false, Ground::Normal, 60);
         assert_eq!(s.m.action(), Action::Walk);
         assert_eq!(s.m.velocity, 2.0);
-        assert!((s.m.x - 2.0).abs() < 0.05, "{}", s.m.x);
+        // The setting is 2.0, but friction costs 0.1897 per physics step.
+        assert!((s.m.x - 1.8103).abs() < 0.05, "{}", s.m.x);
+    }
+
+    #[test]
+    fn held_speed_loses_one_physics_step_of_friction() {
+        let mut s = Sim::new();
+        s.run(1, false, Ground::Normal, 1);
+        s.run(1, true, Ground::Normal, 1);
+        let x0 = s.m.x;
+        s.run(1, false, Ground::Normal, 600);
+        let speed = (s.m.x - x0) / (600.0 * DT);
+        assert!((speed - 3.4103).abs() < 1e-3, "{speed}");
     }
 
     #[test]

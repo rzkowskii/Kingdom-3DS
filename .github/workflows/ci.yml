@@ -22,11 +22,23 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev libx11-dev libxi-dev libgl1-mesa-dev shellcheck
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy
+          components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
       - run: python3 tools/check_public_files.py
       - run: cargo build --workspace --all-targets --locked
       - run: cargo test --workspace --locked
+      # Synthetic islands only (no game files): every scenario over 24 seeds
+      # and at 1, 2 and 3 ticks per frame (the Old 3DS catch-up path).
+      - name: Gameplay regression sweep
+        run: cargo run --release --locked -p regress -- run --seeds 24 --tpf 1,2,3 --report regress-report.toml
+      - name: Upload regression report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: regress-report
+          path: regress-report.toml
+          if-no-files-found: ignore
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: setup.sh lints
         run: shellcheck build.sh tools/setup.sh tools/cia/build.sh
@@ -45,10 +57,13 @@ jobs:
           echo "$DEVKITPRO/tools/bin" >> "$GITHUB_PATH"
       - uses: dtolnay/rust-toolchain@nightly
         with:
-          components: rust-src
+          components: rust-src, rustfmt
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: crates/n3ds
+      - name: cargo fmt (3DS crate, outside the workspace)
+        working-directory: crates/n3ds
+        run: cargo +nightly fmt --check
       - run: cargo install --locked cargo-3ds
       # The romfs is made from your own game files, so CI builds with an
       # empty one: this checks the code compiles and links.

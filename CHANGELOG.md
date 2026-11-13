@@ -1,5 +1,81 @@
 # Changelog
 
+## 1.3.0 — 2026-11-08
+
+### Added
+
+- 3DS debug overlay (tap SELECT): the first line now shows FPS averaged
+  over 30 frames, the lowest and highest readings, and the longest single
+  frame since the overlay was opened. Reopen it to reset them.
+- README: season comparison screenshots (Rust port on PC next to the
+  original PC game), the 3DS bottom screen, a recap of how the regression
+  runner checks lighting and movement speeds, and the first Old 3DS FPS
+  numbers (57.9 idle, about 26–35 in busy play, low 24.6, high 59.9).
+- `crates/regress`: a deterministic gameplay regression and parity
+  framework (see `docs/regression/ARCHITECTURE.md`). It has a headless
+  runner that drives `GameState` exactly as `Session` does, input scripts,
+  versioned snapshots compared with tolerances, golden baselines, a coin
+  conservation ledger, and original-game reference fixtures that record
+  their evidence and whether anyone has verified them. The first 17
+  scenarios cover coins, paying, the purse, movement, building and the
+  day/night cycle. The CLI is `regress list|run|soak|replay`.
+- `tools/orig-harness/` and `regress orig`: measure the original PC game
+  (your own copy, never committed) with a BepInEx plugin that fixes the
+  frame rate, seeds Unity's RNG, plays the port's input scripts and traces
+  named state. The same metrics are computed from the original's trace and
+  from the port on your island, and the results become `trace-*` reference
+  fixtures.
+- `citizen_walk` / `citizen_run` scenarios and the harness's `@drive`
+  setup: a peasant with its AI off holds a `Mover` speed, in both games.
+- `time_of_day_lighting` scenario and `time-of-day-lighting` fixture: the
+  real director and blender run over synthetic presets for three days.
+  Each lighting phase must start on schedule every day (dawn 05:00, day
+  08:00, evening 16:00, night 21:15), nothing else may move the light, the
+  same hour must look the same each day, and random times of day must show
+  the light their window promises.
+- `regress tod --assets DIR`: picks random times of day from a seed (or a
+  given `--seed`), measures the port's lighting on the real island, and
+  reports the schedule, the lit day and night lengths, and each sample's
+  light. `--shots` takes desktop screenshots at those clock times. `--orig`
+  runs the original under the harness, which now samples the blender and
+  takes screenshots at clock times. The report puts the two side by side
+  and flags where the port looks darker, brighter, warmer, colder or
+  flatter.
+  `--weather NAME[,NAME...]` forces that weather in both games (the port's
+  director and the original's `Day` assets) so their lighting can be
+  compared like for like; `--weather all` runs every weather with a full
+  set of summer presets in turn and ends with a summary across them.
+- Desktop dev flags for that: `--shots FILE`, `--idle`, `--camp`, `--god`,
+  `--force-weather NAME` (every day gets that weather and blends on the
+  normal schedule; the random pick still happens, so gameplay is unchanged).
+- CI checks formatting (`cargo fmt --check`, the 3DS crate too).
+- Desktop `--record FILE` records a fresh run's input as a replay that
+  `regress replay` plays back and checks.
+
+### Fixed
+
+- The monarch moved about 5% too fast. In the original, ground friction
+  slows the steed on every physics step before `Mover` restores the
+  speed setting, so it always moves 0.19 units/s slower than the setting.
+  Walking is now 1.81 units/s and galloping 3.41, which matches what the
+  original measures (`orig_walk` / `orig_gallop`).
+- Citizens moved too fast, by about 22% at walking speed. Their bodies
+  have drag 1 as well as friction, so a held speed `s` actually moves at
+  (s − 0.12)/1.02: a peasant walks at 0.47 instead of 0.6 and runs at
+  1.25 instead of 1.4, matching the original (`orig_citizen_walk` /
+  `orig_citizen_run`). Braking includes the drag too.
+- Two builders landing the last stroke on the same site in the same tick
+  reported it built twice and ran its "just built" effects twice (a
+  TowerKnight would get two shield shops). Found by the `many_builders`
+  seed sweep.
+
+### Known issues (found by the regression runner)
+
+- Nothing stops the monarch at the ends of the island (`island_edge`,
+  XFAIL).
+- Saving while coins are still tumbling in the purse changes how many
+  spill after loading: the purse solver's warm-start impulses aren't saved.
+
 ## 1.2.0 — 2026-11-05
 
 ### Added

@@ -596,6 +596,12 @@ impl GameState {
         }
     }
 
+    /// Rebuild the payable list on the next tick: for tests and scenarios
+    /// that place objects with `level.add` after the island is generated.
+    pub fn mark_payables_dirty(&mut self) {
+        self.payables_dirty = true;
+    }
+
     /// Debug: finish every scaffold now.
     pub fn complete_construction(&mut self, world: &WorldData) {
         let building: Vec<u32> = self
@@ -1584,9 +1590,13 @@ impl GameState {
         }
 
         crate::prof::mark("pay");
+        // Sites finished this tick. Two builders can land the last stroke on
+        // the same site in one tick; it's built (and `started`) once.
+        let mut built_now: Vec<u32> = Vec::new();
         for id in build::step(world, &mut self.level, dt) {
             self.payables_dirty = true;
             self.started(world, id);
+            built_now.push(id);
             events.push(GameEvent::Built(id));
         }
         if self.level.objects.iter().any(|o| o.cooldown > 0.0) {
@@ -1835,7 +1845,8 @@ impl GameState {
                         .level
                         .index_of(id)
                         .is_some_and(|i| !build::under_construction(world, &self.level.objects[i]));
-                    if done {
+                    if done && !built_now.contains(&id) {
+                        built_now.push(id);
                         self.payables_dirty = true;
                         self.started(world, id);
                         events.push(GameEvent::Built(id));
@@ -3118,6 +3129,54 @@ mod tests {
             u.ai,
             o.x
         );
+    }
+
+    #[test]
+    fn two_workers_finishing_a_knight_tower_spawn_one_shield_shop() {
+        let mut w = empty_world(0);
+        let mut tower = wall_proto("TowerKnight", 3, None, 2);
+        tower.tower_knight = true;
+        w.protos = vec![
+            tower,
+            Proto {
+                name: "ShieldShop".to_string(),
+                ..Default::default()
+            },
+        ];
+        w.shield_shop = Some(1);
+        w.layers = vec![crate::data::LayerDef { ratio: 1.0, z: 0.0 }; 7];
+        let mut g = GameState::new(&w, 0, 4);
+        let x = g.campfire;
+        let mut scaffold = level::instantiate(&w, 0, Layer::Game, x, 0.0, 0.1, 1.0);
+        scaffold.build = Some(0.0);
+        let tower = g.level.add(scaffold);
+        for offset in [-0.25, 0.25] {
+            g.population.spawn(Role::Worker, x + offset, &mut g.rng);
+            g.population.units.last_mut().unwrap().ai = crate::units::Ai::Work {
+                target: tower,
+                working: true,
+                t: 0.7,
+            };
+        }
+
+        let mut events = Vec::new();
+        g.tick(&w, &Controls::default(), &mut events);
+
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, GameEvent::Unit(UnitEvent::BuildPoint(id)) if *id == tower))
+                .count(),
+            2
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, GameEvent::Built(id) if *id == tower))
+                .count(),
+            1
+        );
+        assert_eq!(g.level.objects.iter().filter(|o| o.proto == 1).count(), 1);
     }
 
     /// At night a worker doesn't take a job outside the walls: sent out and

@@ -1,0 +1,133 @@
+# Blessed by `cargo run -p regress -- run --bless`. Internal regression
+# baseline, not original-game evidence.
+[meta]
+schema = 1
+commit = "9f1ac79c3ba2-dirty"
+build = "1.2.0"
+profile = "release"
+platform = "x86_64-unknown-linux-gnu"
+fixture = "purse_full_pickup"
+world = "synthetic"
+island = 0
+seed = 1
+ticks_per_frame = 1
+ticks = 1200
+tick_seconds = 0.01666666753590107
+
+[[checkpoint]]
+version = 1
+tick = 300
+clock_day = 0
+day_shown = 1
+daytime = false
+season = "Summer"
+wallet = 42
+coins_live = 10
+coins_floating = 0
+coins_held = 0
+roles = [0, 0, 0, 0, 0, 0]
+objects = 0
+under_construction = 0
+has_crown = true
+game_over = false
+won = false
+clock_time = 4.499963760375977
+monarch_x = 0.0
+monarch_velocity = 0.0
+state_hash = "68e0ac28b3e8ee03"
+event_hash = "e2447688cd2d92b8"
+
+[checkpoint.events]
+"Bag.Spilled" = 18
+"Coin.HitGround" = 9
+"Coin.PickedUp" = 10
+"WaveDue.Regular" = 1
+
+[[checkpoint]]
+version = 1
+tick = 600
+clock_day = 0
+day_shown = 1
+daytime = false
+season = "Summer"
+wallet = 45
+coins_live = 4
+coins_floating = 0
+coins_held = 0
+roles = [0, 0, 0, 0, 0, 0]
+objects = 0
+under_construction = 0
+has_crown = true
+game_over = false
+won = false
+clock_time = 4.999927520751953
+monarch_x = 0.0
+monarch_velocity = 0.0
+state_hash = "90919743c35fb0a9"
+event_hash = "ceae51e888e3936d"
+
+[checkpoint.events]
+"Bag.Spilled" = 23
+"Coin.HitGround" = 12
+"Coin.PickedUp" = 18
+"WaveDue.Regular" = 1
+
+[[checkpoint]]
+version = 1
+tick = 900
+clock_day = 0
+day_shown = 1
+daytime = true
+season = "Summer"
+wallet = 47
+coins_live = 2
+coins_floating = 0
+coins_held = 0
+roles = [0, 0, 0, 0, 0, 0]
+objects = 0
+under_construction = 0
+has_crown = true
+game_over = false
+won = false
+clock_time = 5.49989128112793
+monarch_x = 0.0
+monarch_velocity = 0.0
+state_hash = "deb3bd1fa4bf2606"
+event_hash = "ff3890ecad4ed723"
+
+[checkpoint.events]
+"Bag.Spilled" = 23
+"Coin.HitGround" = 12
+"Coin.PickedUp" = 20
+"Day.Started" = 1
+"WaveDue.Regular" = 1
+
+[[checkpoint]]
+version = 1
+tick = 1200
+clock_day = 0
+day_shown = 1
+daytime = true
+season = "Summer"
+wallet = 47
+coins_live = 2
+coins_floating = 0
+coins_held = 0
+roles = [0, 0, 0, 0, 0, 0]
+objects = 0
+under_construction = 0
+has_crown = true
+game_over = false
+won = false
+clock_time = 5.999855041503906
+monarch_x = 0.0
+monarch_velocity = 0.0
+state_hash = "2e38c97b8be4dfc3"
+event_hash = "ff3890ecad4ed723"
+
+[checkpoint.events]
+"Bag.Spilled" = 23
+"Coin.HitGround" = 12
+"Coin.PickedUp" = 20
+"Day.Started" = 1
+"WaveDue.Regular" = 1

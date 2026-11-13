@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!--
+    BepInEx 5 plugin for YOUR OWN local copy of Kingdom: New Lands (PC).
+    It references the game's UnityEngine.dll and the downloaded BepInEx only
+    at build time, from paths outside the repository; it uses no game code
+    at compile time (everything game-specific is looked up by name).
+  -->
+  <PropertyGroup>
+    <TargetFramework>net35</TargetFramework>
+    <AssemblyName>KingdomTrace</AssemblyName>
+    <LangVersion>latest</LangVersion>
+    <Nullable>disable</Nullable>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <!-- Set by setup.sh: the harness copy's Managed/ and BepInEx/core/. -->
+    <GameManaged Condition="'$(GameManaged)' == ''">../../../gamefiles/harness/game/Kingdom_Data/Managed</GameManaged>
+    <BepInExCore Condition="'$(BepInExCore)' == ''">../../../gamefiles/harness/game/BepInEx/core</BepInExCore>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NETFramework.ReferenceAssemblies.net35" Version="1.0.3" PrivateAssets="all" />
+    <Reference Include="UnityEngine"><HintPath>$(GameManaged)/UnityEngine.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="BepInEx"><HintPath>$(BepInExCore)/BepInEx.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="0Harmony"><HintPath>$(BepInExCore)/0Harmony.dll</HintPath><Private>false</Private></Reference>
+  </ItemGroup>
+</Project>
